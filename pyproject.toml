@@ -1,0 +1,68 @@
+[build-system]
+requires = ["setuptools>=64", "setuptools_scm>=8", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "arbitrix-core"
+dynamic = ["version"]
+description = "MIT-licensed open-source backtest engine and cost model from the Arbitrix trading toolkit."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Arbitrix Team" }]
+keywords = ["backtesting", "quant", "trading", "finance", "cost-model"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Financial and Insurance Industry",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Office/Business :: Financial :: Investment",
+]
+dependencies = [
+    "pandas>=2.0",
+    "numpy>=1.26",
+    "python-dateutil>=2.9",
+    "pytz>=2024.1",
+]
+
+[project.optional-dependencies]
+fast = ["numba>=0.59"]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=4.1",
+    "ruff>=0.5",
+]
+docs = [
+    "mkdocs>=1.5",
+    "mkdocs-material>=9.5",
+    "mkdocstrings[python]>=0.24",
+]
+
+[project.urls]
+Homepage = "https://github.com/G14MB0/arbitrix-core"
+Documentation = "https://g14mb0.github.io/arbitrix-core/"
+Repository = "https://github.com/G14MB0/arbitrix-core"
+Issues = "https://github.com/G14MB0/arbitrix-core/issues"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["arbitrix_core*"]
+
+[tool.setuptools_scm]
+write_to = "src/arbitrix_core/_version.py"
+fallback_version = "0.1.0.dev0"
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
