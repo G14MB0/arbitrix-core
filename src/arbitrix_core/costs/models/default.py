@@ -17,6 +17,8 @@ from .parameterized import (  # noqa: F401
     swap_points,
 )
 
+MODULE_NAME = __name__
+
 __all__ = [
     "configure",
     "commission_one_side",

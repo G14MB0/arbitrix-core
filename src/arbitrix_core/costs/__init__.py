@@ -3,9 +3,21 @@ from __future__ import annotations
 import importlib
 from dataclasses import dataclass
 from types import ModuleType
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from arbitrix_core.costs import base
+
+_pre_import_hooks: List[Callable[[], None]] = []
+
+
+def register_pre_import_hook(hook: Callable[[], None]) -> None:
+    """Register a callable invoked before each cost-model module import.
+
+    Allows hosts (e.g. arbitrix) to inject sys.path adjustments so
+    filesystem-discovered cost models resolve through importlib.
+    """
+    if hook not in _pre_import_hooks:
+        _pre_import_hooks.append(hook)
 
 _COST_FUNCTIONS = (
     "commission_one_side",
@@ -47,6 +59,11 @@ _SYMBOL_MODEL_PARAMETERS: Dict[str, Dict[str, Any]] = {}
 # ---------------------------------------------------------------------------
 
 def _load_module(module_name: str) -> ModuleType:
+    for hook in list(_pre_import_hooks):
+        try:
+            hook()
+        except Exception:
+            pass
     importlib.invalidate_caches()
     return importlib.import_module(module_name)
 
@@ -84,6 +101,9 @@ def _normalize_identifier(identifier: Optional[str]) -> tuple[str, str]:
 def _activate_model(identifier: Optional[str]) -> _CostModel:
     name, module_name = _normalize_identifier(identifier)
     module = _load_module(module_name)
+    canonical = getattr(module, "MODULE_NAME", None)
+    if isinstance(canonical, str) and canonical:
+        module_name = canonical
     return _build_model(name, module_name, module)
 
 
@@ -173,6 +193,9 @@ def configure(
             try:
                 model_name, module_name = _normalize_identifier(identifier)
                 module = _load_module(module_name)
+                canonical = getattr(module, "MODULE_NAME", None)
+                if isinstance(canonical, str) and canonical:
+                    module_name = canonical
                 model = _build_model(model_name, module_name, module)
                 model.parameters = (symbol_model_parameters or {}).get(str(symbol).lower(), {}) if symbol_model_parameters else {}
                 _symbol_models[str(symbol).lower()] = model
