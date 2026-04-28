@@ -759,6 +759,8 @@ class Backtester:
         )
 
     def _unrealized_pnl(self, symbol: str, trades: List[Trade], row: pd.Series) -> float:
+        if not trades:
+            return 0.0
         pv = costs.get_point_value(symbol)
         if pv == 0:
             return 0.0
