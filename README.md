@@ -16,3 +16,17 @@ Optional extras:
 ## Quickstart
 
 See full documentation at https://g14mb0.github.io/arbitrix-core/
+
+## Sync to public repo
+
+`arbitrix-core` is published from the upstream Arbitrix monorepo via subtree split. The
+private workflow `.github/workflows/arbitrix-core-sync.yml` force-pushes
+`arbitrix/src/arbitrix_core` to https://github.com/G14MB0/arbitrix-core
+on every push to `main` or `development` that touches the subtree, and
+on `workflow_dispatch`.
+
+Requirements:
+- Repo secret `PUBLIC_REPO_TOKEN` — fine-grained PAT with `Contents: write`
+  scope on `G14MB0/arbitrix-core`.
+- Public repo `development` branch is overwritten on every sync. Do not
+  commit directly to that branch.
