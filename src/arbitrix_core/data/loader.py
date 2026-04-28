@@ -70,7 +70,7 @@ def load_ohlcv(path: PathLike, *, time_col: str = "time") -> pd.DataFrame:
             )
         df[time_col] = pd.to_datetime(df[time_col], utc=True)
         df = df.set_index(time_col)
-        df.index.name = None
+        df.index.name = None  # match validate_ohlcv contract: unnamed DatetimeIndex
     else:
         if df.index.tz is None:
             df.index = df.index.tz_localize("UTC")
