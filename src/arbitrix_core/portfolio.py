@@ -838,7 +838,7 @@ class Portfolio:
         return trade
 
     def _calc_trade_pnl(self, trade: Trade, exit_price: float) -> float:
-        import arbitrix.core.costs as costs
+        import arbitrix_core.costs as costs
         try:
             point_value = costs.get_point_value(trade.symbol)
         except Exception:
@@ -850,7 +850,7 @@ class Portfolio:
         return (trade.entry_price - exit_price) * point_value * trade.volume
 
     def _calc_trade_pnl_volume(self, trade: Trade, exit_price: float, volume: float) -> float:
-        import arbitrix.core.costs as costs
+        import arbitrix_core.costs as costs
         try:
             point_value = costs.get_point_value(trade.symbol)
         except Exception:
