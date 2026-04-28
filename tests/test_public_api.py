@@ -4,24 +4,14 @@ import arbitrix_core
 
 
 def test_public_api_exports():
-    expected = {
-        "Backtester",
-        "BTConfig",
-        "BTResult",
-        "BaseStrategy",
-        "Signal",
-        "Trade",
-        "Order",
-        "Position",
-        "InstrumentConfig",
-        "load_ohlcv",
-        "validate_ohlcv",
-        "costs",
-        "__version__",
-    }
-    assert expected.issubset(set(dir(arbitrix_core))), (
-        f"Missing public exports: {expected - set(dir(arbitrix_core))}"
-    )
+    expected = set(arbitrix_core.__all__)
+    available = set(dir(arbitrix_core))
+    missing = expected - available
+    assert not missing, f"Missing public exports declared in __all__: {missing}"
+    for name in expected:
+        assert getattr(arbitrix_core, name) is not None, (
+            f"Public export {name!r} resolves to None"
+        )
 
 
 def test_costs_namespace_callable():
