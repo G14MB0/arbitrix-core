@@ -1,0 +1,64 @@
+site_name: arbitrix-core
+site_url: https://g14mb0.github.io/arbitrix-core/
+repo_url: https://github.com/G14MB0/arbitrix-core
+repo_name: G14MB0/arbitrix-core
+edit_uri: edit/development/docs/
+
+theme:
+  name: material
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - content.code.copy
+    - content.code.annotate
+  palette:
+    - scheme: default
+      primary: indigo
+      toggle: { icon: material/brightness-7, name: Switch to dark mode }
+    - scheme: slate
+      primary: indigo
+      toggle: { icon: material/brightness-4, name: Switch to light mode }
+
+plugins:
+  - search
+  - mkdocstrings:
+      default_handler: python
+      handlers:
+        python:
+          paths: [src]
+          options:
+            show_source: false
+            show_root_heading: true
+            show_signature_annotations: true
+            separate_signature: true
+            members_order: source
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - toc:
+      permalink: true
+
+nav:
+  - Home: index.md
+  - Getting started: getting-started.md
+  - Data format: data-format.md
+  - Strategies: strategies.md
+  - Cost models: costs.md
+  - Configuration: configuration.md
+  - API reference:
+      - Backtest: api/backtest.md
+      - Costs: api/costs.md
+      - Data: api/data.md
+      - Strategies: api/strategies.md
+  - Contributing: contributing.md
