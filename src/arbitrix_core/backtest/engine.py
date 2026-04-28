@@ -997,7 +997,7 @@ class Backtester:
             return updated, equity, gross_equity
 
         # Vectorised path
-        from arbitrix.core.backtest.fast_loop import check_stops
+        from arbitrix_core.backtest.fast_loop import check_stops
 
         entry_prices = np.array([t.entry_price for t in trades_to_check], dtype=np.float64)
         stop_points = np.array([t.stop_points for t in trades_to_check], dtype=np.float64)
