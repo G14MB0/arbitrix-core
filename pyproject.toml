@@ -8,14 +8,14 @@ dynamic = ["version"]
 description = "MIT-licensed open-source backtest engine and cost model from the Arbitrix trading toolkit."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "Arbitrix Team" }]
 keywords = ["backtesting", "quant", "trading", "finance", "cost-model"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Intended Audience :: Financial and Insurance Industry",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -56,7 +56,7 @@ where = ["src"]
 include = ["arbitrix_core*"]
 
 [tool.setuptools_scm]
-write_to = "src/arbitrix_core/_version.py"
+version_file = "src/arbitrix_core/_version.py"
 fallback_version = "0.1.0.dev0"
 
 [tool.pytest.ini_options]
