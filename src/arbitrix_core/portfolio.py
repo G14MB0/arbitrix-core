@@ -472,17 +472,6 @@ class Portfolio:
                 "orders": len(removed_orders),
             }
 
-    def get_live_metrics(self) -> Dict[str, Any]:
-        with self._lock:
-            closed = list(self._closed_trades)
-            initial_equity = float(self._initial_equity)
-        try:
-            from arbitrix.live.stats_tracker import LiveStatsTracker
-        except Exception:
-            return {}
-        tracker = LiveStatsTracker(initial_equity=initial_equity)
-        return tracker.compute(closed)
-
     def _cancel_pending_orders(
         self,
         symbol: str,
