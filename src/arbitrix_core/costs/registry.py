@@ -6,7 +6,7 @@ from typing import Any, Dict, Mapping, Optional
 
 DEFAULT_COST_MODEL_TEMPLATES: Dict[str, Dict[str, Any]] = {
     "default": {
-        "module": "arbitrix.core.costs.models.parameterized",
+        "module": "arbitrix_core.costs.models.parameterized",
         "enabled": True,
         "source": "builtin",
     }
