@@ -344,7 +344,6 @@ def _detect_spread_only(info: Dict[str, Any], inst: Optional[InstrumentConfig]) 
     if inst and getattr(inst, "spread_only", False):
         return True
     # Provider hints: commission=0, spread_only flags, or explicit type
-    flags = {str(k).lower(): info[k] for k in info.keys()}
     # Common patterns across brokers/platforms
     zero_like = {0, 0.0, "0", "0.0", None}
     if info.get("commission") in zero_like:
@@ -456,7 +455,6 @@ def commission_from_notional(
     Scheme is auto-resolved from InstrumentConfig and provider info.
     Always enforces commission_minimum(volume_lot) > 0 to avoid zeros.
     """
-    inst = get_instrument(symbol)
     notional_value = notional if notional is not None else trade_notional(symbol, price, volume_lot)
     scheme, p = _resolve_commission_scheme(symbol)
 

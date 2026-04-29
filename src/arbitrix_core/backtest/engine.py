@@ -11,13 +11,13 @@ from typing import Any, Callable, Dict, Iterable, List, Optional
 import numpy as np
 import pandas as pd
 
-logger = logging.getLogger(__name__)
-
 import arbitrix_core.costs as costs
 from arbitrix_core.portfolio import Portfolio
 from arbitrix_core.strategies.base import BaseStrategy, invoke_strategy_on_bar
 from arbitrix_core.trading import Order, Signal, Trade, Position
 from arbitrix_core.types import InstrumentConfig
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -291,8 +291,6 @@ class Backtester:
         equity_by_day: Dict[pd.Timestamp, float] = {}
         equity_marked_by_day: Dict[pd.Timestamp, float] = {}
         gross_by_day: Dict[pd.Timestamp, float] = {}
-        position_snapshots: List[Position] = []
-
         early_stop_flag = bool(
             early_stop_conditions.get("enabled", True)
             if isinstance(early_stop_conditions, dict)
