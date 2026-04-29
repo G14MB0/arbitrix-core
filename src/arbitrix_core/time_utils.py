@@ -1,127 +1,57 @@
 from __future__ import annotations
 
 from datetime import date
-from typing import Any, Iterable, Sequence, Tuple
+from typing import Any, Iterable, Sequence
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import pandas as pd
 
-DEFAULT_SYMBOL_TIMEZONE = "UTC"
 
-# Curated list shared across API validation and UI selector.
-ALLOWED_SYMBOL_TIMEZONES: Tuple[str, ...] = (
-    "UTC",
-    "America/New_York",
-    "America/Chicago",
-    "America/Denver",
-    "America/Los_Angeles",
-    "America/Sao_Paulo",
-    "Europe/London",
-    "Europe/Paris",
-    "Europe/Berlin",
-    "Europe/Rome",
-    "Europe/Madrid",
-    "Europe/Zurich",
-    "Europe/Athens",
-    "Europe/Istanbul",
-    "Asia/Dubai",
-    "Asia/Kolkata",
-    "Asia/Singapore",
-    "Asia/Hong_Kong",
-    "Asia/Shanghai",
-    "Asia/Tokyo",
-    "Australia/Sydney",
-    "Pacific/Auckland",
-)
-
-PROVIDER_TIME_SEMANTIC_DEFAULT = "default"
-PROVIDER_TIME_SEMANTIC_MT5_WALL_CLOCK = "mt5_wall_clock"
-_SUPPORTED_PROVIDER_TIME_SEMANTICS = {
-    PROVIDER_TIME_SEMANTIC_DEFAULT,
-    PROVIDER_TIME_SEMANTIC_MT5_WALL_CLOCK,
-}
-
-
-def list_supported_symbol_timezones() -> list[str]:
-    return list(ALLOWED_SYMBOL_TIMEZONES)
-
-
-def normalize_symbol_timezone(value: Any, *, allow_none: bool = False) -> str | None:
-    if value is None:
-        if allow_none:
-            return None
-        raise ValueError("timezone is required")
-    tz_name = str(value).strip()
-    if not tz_name:
-        if allow_none:
-            return None
-        raise ValueError("timezone is required")
-    if tz_name not in ALLOWED_SYMBOL_TIMEZONES:
-        raise ValueError(f"Unsupported timezone '{tz_name}'")
+def _validate_tz(tz_name: str) -> str:
+    name = str(tz_name or "").strip()
+    if not name:
+        raise ValueError("timezone name must not be empty")
     try:
-        ZoneInfo(tz_name)
-    except ZoneInfoNotFoundError as exc:  # pragma: no cover - depends on host tzdata
-        raise ValueError(f"Timezone '{tz_name}' is not available on this runtime") from exc
-    return tz_name
+        ZoneInfo(name)
+    except ZoneInfoNotFoundError as exc:
+        raise ValueError(f"Unknown timezone '{name}'") from exc
+    return name
 
 
-def normalize_provider_time_semantic(value: Any) -> str:
-    mode = str(value or PROVIDER_TIME_SEMANTIC_DEFAULT).strip().lower()
-    if mode not in _SUPPORTED_PROVIDER_TIME_SEMANTICS:
-        raise ValueError(f"Unsupported provider time semantic '{mode}'")
-    return mode
-
-
-def normalize_ohlcv_index_to_utc(
-    index: Any,
-    *,
-    symbol_timezone: str,
-    provider_semantic_mode: str = PROVIDER_TIME_SEMANTIC_DEFAULT,
-) -> pd.DatetimeIndex:
-    tz_name = normalize_symbol_timezone(symbol_timezone)
-    mode = normalize_provider_time_semantic(provider_semantic_mode)
+def normalize_ohlcv_index_to_utc(index: Any) -> pd.DatetimeIndex:
     parsed = pd.to_datetime(index, errors="coerce")
     dt_index = pd.DatetimeIndex(parsed)
     if len(dt_index) == 0:
         return dt_index.tz_localize("UTC")
-    if mode == PROVIDER_TIME_SEMANTIC_MT5_WALL_CLOCK:
-        # MT5 feeds are interpreted as wall-clock bars in provider/local market timezone.
-        naive = dt_index.tz_localize(None) if dt_index.tz is not None else dt_index
-        localized = naive.tz_localize(tz_name, ambiguous="infer", nonexistent="shift_forward")
-        return localized.tz_convert("UTC").sort_values()
     if dt_index.tz is None:
-        localized = dt_index.tz_localize(tz_name, ambiguous="infer", nonexistent="shift_forward")
-        return localized.tz_convert("UTC").sort_values()
+        raise ValueError(
+            "OHLCV index must be timezone-aware (UTC). "
+            "Naive timestamps are not accepted — ensure the data source returns UTC-aware data."
+        )
     return dt_index.tz_convert("UTC").sort_values()
 
 
-def normalize_ohlcv_frame_to_utc(
-    frame: pd.DataFrame,
-    *,
-    symbol_timezone: str,
-    provider_semantic_mode: str = PROVIDER_TIME_SEMANTIC_DEFAULT,
-) -> pd.DataFrame:
+def normalize_ohlcv_frame_to_utc(frame: pd.DataFrame) -> pd.DataFrame:
     if frame is None:
         return frame
     normalized = frame.copy()
-    normalized.index = normalize_ohlcv_index_to_utc(
-        normalized.index,
-        symbol_timezone=symbol_timezone,
-        provider_semantic_mode=provider_semantic_mode,
-    )
+    normalized.index = normalize_ohlcv_index_to_utc(normalized.index)
     normalized = normalized[~normalized.index.isna()]
     return normalized.sort_index()
 
 
 def to_market_time(ts: Any, tz: str) -> pd.Timestamp:
-    market_tz = normalize_symbol_timezone(tz)
+    market_tz = _validate_tz(tz)
     value = to_utc_time(ts)
     return value.tz_convert(market_tz)
 
 
 def to_utc_time(ts: Any, tz: str | None = None) -> pd.Timestamp:
     timestamp = pd.Timestamp(ts)
-    local_tz = normalize_symbol_timezone(tz, allow_none=True)
+    if tz is not None:
+        local_tz = _validate_tz(tz)
+    else:
+        local_tz = None
     if timestamp.tzinfo is None:
         source_tz = local_tz or "UTC"
         localized = pd.DatetimeIndex([timestamp]).tz_localize(
@@ -182,16 +112,9 @@ def _parse_hhmm(value: Any) -> int | None:
 
 
 __all__ = [
-    "ALLOWED_SYMBOL_TIMEZONES",
-    "DEFAULT_SYMBOL_TIMEZONE",
-    "PROVIDER_TIME_SEMANTIC_DEFAULT",
-    "PROVIDER_TIME_SEMANTIC_MT5_WALL_CLOCK",
     "is_in_session",
-    "list_supported_symbol_timezones",
     "normalize_ohlcv_frame_to_utc",
     "normalize_ohlcv_index_to_utc",
-    "normalize_provider_time_semantic",
-    "normalize_symbol_timezone",
     "session_day",
     "session_hour",
     "to_market_time",

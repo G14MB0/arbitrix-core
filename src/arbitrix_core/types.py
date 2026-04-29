@@ -13,7 +13,6 @@ class InstrumentConfig:
     """
 
     ib_symbol: str
-    timezone: Optional[str] = None
     security_type: str = "CFD"
     exchange: str = "SMART"
     currency: str = "USD"
