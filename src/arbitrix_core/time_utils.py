@@ -1,10 +1,30 @@
 from __future__ import annotations
 
-from datetime import date
-from typing import Any, Iterable, Sequence
+from datetime import date, datetime
+from typing import Any, Iterable, Optional, Sequence
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import pandas as pd
+
+
+def coerce_utc_datetime(value: Any) -> Optional[datetime]:
+    """Coerce a datetime/Timestamp to a UTC-aware python ``datetime``.
+
+    ``None``, ``NaT``, or ``NaN`` return ``None``. Naive input is assumed to be
+    UTC and localized; tz-aware input is converted to UTC. The result is a plain
+    python :class:`datetime.datetime` (not a :class:`pandas.Timestamp`).
+
+    This is the single shared UTC coercer for the order/fill/reconciliation and
+    cache paths — every site delegates here so the NaT guard and the
+    naive-as-UTC assumption stay identical everywhere (ARB-90).
+    """
+    if value is None:
+        return None
+    ts = pd.Timestamp(value)
+    if pd.isna(ts):
+        return None
+    ts = ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
+    return ts.to_pydatetime()
 
 
 def _validate_tz(tz_name: str) -> str:
@@ -112,6 +132,7 @@ def _parse_hhmm(value: Any) -> int | None:
 
 
 __all__ = [
+    "coerce_utc_datetime",
     "is_in_session",
     "normalize_ohlcv_frame_to_utc",
     "normalize_ohlcv_index_to_utc",
