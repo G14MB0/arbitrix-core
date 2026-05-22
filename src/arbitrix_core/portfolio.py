@@ -289,6 +289,22 @@ class Portfolio:
                 return True
         return False
 
+    def update_order_price(self, order_id: str, new_price: float) -> bool:
+        """Reprice a working pending order's entry price.
+
+        SL/TP are stored as point offsets from the entry, so they ride along with
+        the repriced entry (the bracket keeps its relative shape). Used by the
+        ``modify_price`` management signal (ARB-103).
+        """
+        with self._lock:
+            for order in self._orders:
+                if order.id != order_id:
+                    continue
+                order.price = float(new_price)
+                self._bump()
+                return True
+        return False
+
     def close_trade(self, trade: Trade, *, exit_price: float, exit_time: pd.Timestamp, reason: str) -> None:
         with self._lock:
             if trade in self._open_trades:

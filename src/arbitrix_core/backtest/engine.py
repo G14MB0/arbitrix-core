@@ -1078,7 +1078,7 @@ class Backtester:
                 open_trades = []
                 continue
 
-            if filtered_sig.action in ("close", "partial_close", "modify_sl", "modify_tp", "cancel_order"):
+            if filtered_sig.action in ("close", "partial_close", "modify_sl", "modify_tp", "modify_price", "cancel_order"):
                 equity, gross_equity, open_trades, working_orders = self._apply_management_signal(
                     filtered_sig,
                     row,
@@ -1187,6 +1187,20 @@ class Backtester:
         gross_equity: float,
     ) -> tuple[float, float, List[Trade], List[Order]]:
         action = signal.action
+        if action == "modify_price":
+            # ARB-103: reprice a working pending entry; SL/TP point offsets ride
+            # along, mirroring Portfolio.update_order_price on the live path.
+            order_id = signal.target_order_id
+            if not order_id:
+                logger.debug("Backtest modify_price missing target_order_id")
+                return equity, gross_equity, open_trades, working_orders
+            order = next((o for o in working_orders if o.id == order_id), None)
+            if order is None or order.price is None or signal.new_price is None:
+                logger.debug("Backtest modify_price: order not found / no price: %s", order_id)
+                return equity, gross_equity, open_trades, working_orders
+            order.price = float(signal.new_price)
+            return equity, gross_equity, open_trades, working_orders
+
         if action in ("close", "partial_close", "modify_sl", "modify_tp"):
             trade_id = signal.target_trade_id
             if not trade_id:

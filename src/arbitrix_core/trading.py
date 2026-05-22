@@ -14,6 +14,7 @@ SignalAction = Literal[
     "partial_close",
     "modify_sl",
     "modify_tp",
+    "modify_price",
     "cancel_order",
 ]
 OrderType = Literal["market", "limit", "stop"]
@@ -46,6 +47,7 @@ class Signal:
     close_volume: Optional[float] = None
     new_sl: Optional[float] = None
     new_tp: Optional[float] = None
+    new_price: Optional[float] = None  # repriced entry for a working pending (modify_price)
     risk_multiplier: float = 1.0
     magic: Optional[int] = None
 
