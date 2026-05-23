@@ -123,6 +123,7 @@ class Backtester:
         window_start: Optional[datetime] = None,
         capture_prepared: bool = False,
         collect_diagnostics: bool = True,
+        bar_observer: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> BTResult:
         run_started = time.monotonic()
         prepare_elapsed = 0.0
@@ -469,6 +470,21 @@ class Backtester:
                         break
             if runtime_breakdown_enabled:
                 loop_breakdown["early_stop_check_s"] += max(0.0, time.monotonic() - section_started)
+            if bar_observer is not None:
+                bar_observer(
+                    {
+                        "bar_ts": ts,
+                        "row": row,
+                        "portfolio": portfolio,
+                        "open_trades": list(open_trades),
+                        "closed_trades": list(closed_trades),
+                        "working_orders": list(working_orders),
+                        "equity": float(equity),
+                        "gross_equity": float(gross_equity),
+                        "bar_signals": list(bar_signals) if bar_signals else [],
+                        "newly_filled": list(newly_filled),
+                    }
+                )
         loop_elapsed = max(0.0, time.monotonic() - loop_started)
 
         last_ts = prepared.index[-1].tz_localize("UTC") if prepared.index[-1].tzinfo is None else prepared.index[-1].tz_convert("UTC")
