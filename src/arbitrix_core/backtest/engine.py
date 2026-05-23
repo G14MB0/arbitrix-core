@@ -454,6 +454,26 @@ class Backtester:
             if runtime_breakdown_enabled:
                 loop_breakdown["mark_to_market_s"] += max(0.0, time.monotonic() - section_started)
 
+            # Fire the bar observer BEFORE the early-stop check so the trigger
+            # bar is still recorded in the parity-oracle ledger. All per-bar
+            # state (`equity`, `gross_equity`, fills, signals) is finalized at
+            # this point — the early-stop block below only reads it.
+            if bar_observer is not None:
+                bar_observer(
+                    {
+                        "bar_ts": ts,
+                        "row": row,
+                        "portfolio": portfolio,
+                        "open_trades": list(open_trades),
+                        "closed_trades": list(closed_trades),
+                        "working_orders": list(working_orders),
+                        "equity": float(equity),
+                        "gross_equity": float(gross_equity),
+                        "bar_signals": list(bar_signals) if bar_signals else [],
+                        "newly_filled": list(newly_filled),
+                    }
+                )
+
             section_started = time.monotonic() if runtime_breakdown_enabled else 0.0
             if early_stop_enabled and bar_count % check_interval == 0:
                 if max_dd_threshold is not None and equity_by_day:
@@ -470,21 +490,6 @@ class Backtester:
                         break
             if runtime_breakdown_enabled:
                 loop_breakdown["early_stop_check_s"] += max(0.0, time.monotonic() - section_started)
-            if bar_observer is not None:
-                bar_observer(
-                    {
-                        "bar_ts": ts,
-                        "row": row,
-                        "portfolio": portfolio,
-                        "open_trades": list(open_trades),
-                        "closed_trades": list(closed_trades),
-                        "working_orders": list(working_orders),
-                        "equity": float(equity),
-                        "gross_equity": float(gross_equity),
-                        "bar_signals": list(bar_signals) if bar_signals else [],
-                        "newly_filled": list(newly_filled),
-                    }
-                )
         loop_elapsed = max(0.0, time.monotonic() - loop_started)
 
         last_ts = prepared.index[-1].tz_localize("UTC") if prepared.index[-1].tzinfo is None else prepared.index[-1].tz_convert("UTC")
