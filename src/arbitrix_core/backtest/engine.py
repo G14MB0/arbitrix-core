@@ -123,6 +123,7 @@ class Backtester:
         window_start: Optional[datetime] = None,
         capture_prepared: bool = False,
         collect_diagnostics: bool = True,
+        bar_observer: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> BTResult:
         run_started = time.monotonic()
         prepare_elapsed = 0.0
@@ -469,6 +470,21 @@ class Backtester:
                         break
             if runtime_breakdown_enabled:
                 loop_breakdown["early_stop_check_s"] += max(0.0, time.monotonic() - section_started)
+            if bar_observer is not None:
+                bar_observer(
+                    {
+                        "bar_ts": ts,
+                        "row": row,
+                        "portfolio": portfolio,
+                        "open_trades": list(open_trades),
+                        "closed_trades": list(closed_trades),
+                        "working_orders": list(working_orders),
+                        "equity": float(equity),
+                        "gross_equity": float(gross_equity),
+                        "bar_signals": list(bar_signals) if bar_signals else [],
+                        "newly_filled": list(newly_filled),
+                    }
+                )
         loop_elapsed = max(0.0, time.monotonic() - loop_started)
 
         last_ts = prepared.index[-1].tz_localize("UTC") if prepared.index[-1].tzinfo is None else prepared.index[-1].tz_convert("UTC")
@@ -1078,7 +1094,7 @@ class Backtester:
                 open_trades = []
                 continue
 
-            if filtered_sig.action in ("close", "partial_close", "modify_sl", "modify_tp", "cancel_order"):
+            if filtered_sig.action in ("close", "partial_close", "modify_sl", "modify_tp", "modify_price", "cancel_order"):
                 equity, gross_equity, open_trades, working_orders = self._apply_management_signal(
                     filtered_sig,
                     row,
@@ -1187,6 +1203,20 @@ class Backtester:
         gross_equity: float,
     ) -> tuple[float, float, List[Trade], List[Order]]:
         action = signal.action
+        if action == "modify_price":
+            # ARB-103: reprice a working pending entry; SL/TP point offsets ride
+            # along, mirroring Portfolio.update_order_price on the live path.
+            order_id = signal.target_order_id
+            if not order_id:
+                logger.debug("Backtest modify_price missing target_order_id")
+                return equity, gross_equity, open_trades, working_orders
+            order = next((o for o in working_orders if o.id == order_id), None)
+            if order is None or order.price is None or signal.new_price is None:
+                logger.debug("Backtest modify_price: order not found / no price: %s", order_id)
+                return equity, gross_equity, open_trades, working_orders
+            order.price = float(signal.new_price)
+            return equity, gross_equity, open_trades, working_orders
+
         if action in ("close", "partial_close", "modify_sl", "modify_tp"):
             trade_id = signal.target_trade_id
             if not trade_id:

@@ -13,7 +13,6 @@ class InstrumentConfig:
     """
 
     ib_symbol: str
-    timezone: Optional[str] = None
     security_type: str = "CFD"
     exchange: str = "SMART"
     currency: str = "USD"
@@ -45,3 +44,7 @@ class InstrumentConfig:
     commission_rate: Optional[float] = None
     commission_min: Optional[float] = None
     cost_model: Optional[str] = None
+    # Smallest order quantity the venue accepts (e.g. 1 contract for a future,
+    # 1 share for a stock). Used by the live executor to decide whether a
+    # partial-close residual is too small to resize a protective leg to (ARB-96).
+    min_order_size: Optional[float] = None
