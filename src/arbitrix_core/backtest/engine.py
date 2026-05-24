@@ -425,6 +425,11 @@ class Backtester:
             # Attempt fills
             section_started = time.monotonic() if runtime_breakdown_enabled else 0.0
             newly_filled: List[Trade] = []
+            # ARB-129 iter-5: parallel list of source Orders for each filled
+            # Trade, exposed via the bar_observer ctx so the parity ledger
+            # emitter can record the actual Order.type on the entry
+            # OrderRecord (the Trade alone does not carry order_type).
+            newly_filled_orders: List[Order] = []
             remaining_orders: List[Order] = []
             for order in working_orders:
                 filled = self._try_fill_order(order, row)
@@ -434,6 +439,7 @@ class Backtester:
                 trade, equity = self._open_trade_from_order(symbol, order, filled, row, equity)
                 if trade:
                     newly_filled.append(trade)
+                    newly_filled_orders.append(order)
             working_orders = remaining_orders
             open_trades.extend(newly_filled)
             if runtime_breakdown_enabled:
@@ -471,6 +477,12 @@ class Backtester:
                         "gross_equity": float(gross_equity),
                         "bar_signals": list(bar_signals) if bar_signals else [],
                         "newly_filled": list(newly_filled),
+                        # ARB-129 iter-5: parallel to newly_filled, exposes the
+                        # source Order for each filled Trade so observers can
+                        # read Order.type / Order.price. Backwards-compatible:
+                        # existing observers that ignore unknown keys are
+                        # unaffected.
+                        "newly_filled_orders": list(newly_filled_orders),
                     }
                 )
 
