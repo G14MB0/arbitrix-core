@@ -11,7 +11,8 @@ import threading
 from dataclasses import dataclass
 from typing import Optional
 
-from arbitrix_core.symbols.asset_class import AssetClass
+from arbitrix_core.symbols.asset_class import AssetClass, classify_asset_class, validate_asset_class
+from arbitrix_core.types import InstrumentConfig
 
 
 @dataclass(frozen=True)
@@ -50,3 +51,42 @@ def get_symbol_context(symbol: str) -> SymbolContext:
 def clear_symbol_context_registry() -> None:
     with _LOCK:
         _REGISTRY.clear()
+
+
+def build_symbol_context_from_instrument(
+    inst: InstrumentConfig,
+    *,
+    symbol: str,
+) -> SymbolContext:
+    """Build a fully-populated :class:`SymbolContext` from an :class:`InstrumentConfig`.
+
+    Auto-classifies ``asset_class`` from ``security_type`` when
+    ``inst.asset_class`` is ``None``; validates it against the known taxonomy
+    when explicitly set.
+    """
+    asset_class = (
+        validate_asset_class(inst.asset_class)
+        if inst.asset_class is not None
+        else classify_asset_class(inst.security_type)
+    )
+    multiplier = float(
+        inst.multiplier
+        if inst.multiplier is not None
+        else (inst.contract_size if inst.contract_size is not None else 1.0)
+    )
+    point_value = float(
+        inst.point_value if inst.point_value is not None else multiplier
+    )
+    return SymbolContext(
+        symbol=symbol,
+        asset_class=asset_class,
+        multiplier=multiplier,
+        point_value=point_value,
+        tick_size=float(inst.tick_size or 1.0),
+        currency=str(inst.currency or "USD"),
+        commission_scheme=inst.commission_scheme,
+        fee_per_contract=float(inst.fee_per_contract or 0.0),
+        fee_min_per_order=float(inst.fee_min_per_order or 0.0),
+        min_order_size=float(inst.min_order_size or 1.0),
+        margin_per_contract=None,  # Sub-spec 2 populates
+    )

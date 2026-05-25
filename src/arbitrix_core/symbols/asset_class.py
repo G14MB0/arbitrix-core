@@ -25,3 +25,17 @@ def classify_asset_class(security_type: str) -> AssetClass:
             f"Expected one of {sorted(_SECURITY_TYPE_TO_ASSET_CLASS)}."
         )
     return _SECURITY_TYPE_TO_ASSET_CLASS[key]
+
+
+def validate_asset_class(value: str) -> AssetClass:
+    """Validate a free-string ``asset_class`` against the known taxonomy.
+
+    Returns the value typed as :data:`AssetClass`. Raises :class:`ValueError`
+    on unknown — protects :class:`SymbolContext` from typos at builder time.
+    """
+    valid = set(_SECURITY_TYPE_TO_ASSET_CLASS.values())
+    if value not in valid:
+        raise ValueError(
+            f"Unknown asset_class {value!r}. Expected one of {sorted(valid)}."
+        )
+    return value  # type: ignore[return-value]
