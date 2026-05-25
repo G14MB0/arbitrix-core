@@ -78,12 +78,6 @@ class Portfolio:
         self._version = 0
         self._exposure_cache: Dict[Tuple[str, Optional[str], Optional[pd.Timestamp], int], Dict[str, Any]] = {}
         self._last_prices: Dict[str, float] = {}
-        # Per-symbol aggregated position view used by the margin model
-        # (Sub-spec 2). Maintained separately from ``_open_trades`` so margin
-        # accounting can query ``qty``/``avg_price`` without re-walking the
-        # trade list every bar. Seeded by trade lifecycle methods; tests may
-        # also seed it directly.
-        self._open_positions: Dict[str, Dict[str, float]] = {}
 
     def _bump(self) -> None:
         self._version += 1
@@ -110,24 +104,32 @@ class Portfolio:
         return self._initial_equity
 
     def margin_used(self) -> float:
-        """Sum of per-symbol :meth:`MarginModel.initial` across all open
-        positions in :attr:`_open_positions`.
+        """Sum of per-symbol :meth:`MarginModel.initial` across open positions.
 
-        Unknown symbols (no registry entry) contribute ``0.0`` via the
-        :class:`NoMargin` fallback in :func:`_margin_model_for_symbol`, so a
-        missing margin params row never crashes the equity loop. See
+        Aggregates :attr:`_open_trades` by symbol (sum of volume,
+        volume-weighted entry_price) and asks each symbol's MarginModel for
+        its initial-margin contribution. Unknown symbols (not in the margin
+        registry) fall back to :class:`NoMargin` → zero contribution, so a
+        missing registry entry never crashes the equity loop. See
         Sub-spec 2 / Task 19 for the contract.
         """
-        total = 0.0
+        from collections import defaultdict
+
+        acc: Dict[str, List[float]] = defaultdict(lambda: [0.0, 0.0])  # [vol_sum, notional_sum]
         with self._lock:
-            for symbol, pos in self._open_positions.items():
-                model = _margin_model_for_symbol(symbol)
-                money = model.initial(
-                    symbol,
-                    qty=float(pos["qty"]),
-                    price=float(pos["avg_price"]),
-                )
-                total += money.amount
+            for trade in self._open_trades:
+                if trade.volume <= 0:
+                    continue
+                acc[trade.symbol][0] += float(trade.volume)
+                acc[trade.symbol][1] += float(trade.volume) * float(trade.entry_price)
+        total = 0.0
+        for symbol, (vol, notional) in acc.items():
+            if vol <= 0:
+                continue
+            avg_price = notional / vol
+            model = _margin_model_for_symbol(symbol)
+            money = model.initial(symbol, qty=vol, price=avg_price)
+            total += money.amount
         return total
 
     def margin_available(self) -> float:
