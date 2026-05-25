@@ -182,22 +182,20 @@ class Portfolio:
         """Yield one MarginCallEvent per open symbol when the *total* per-symbol
         maintenance requirement across the book exceeds current equity.
 
-        Sub-spec 4 consumes these events to materialize a forced-flat order at
-        the next close. This function ONLY observes; it does NOT mutate state
-        or place orders.
+        This function ONLY observes; it does NOT mutate state or place orders.
         """
-        acc: Dict[str, List[float]] = defaultdict(lambda: [0.0, 0.0])
+        acc: Dict[str, List[float]] = defaultdict(lambda: [0.0, 0.0])  # [vol_sum, notional_sum]
         with self._lock:
             trades_snapshot = list(self._open_trades)
         for trade in trades_snapshot:
             if trade.volume <= 0:
-                continue
+                continue  # paranoia: stale 0-volume trade post partial-close race
             acc[trade.symbol][0] += float(trade.volume)
             acc[trade.symbol][1] += float(trade.volume) * float(trade.entry_price)
         per_symbol_maint: Dict[str, float] = {}
         for symbol, (vol, notional) in acc.items():
             if vol <= 0:
-                continue
+                continue  # paranoia: stale 0-volume trade post partial-close race
             avg_price = notional / vol
             model = _margin_model_for_symbol(symbol)
             money = model.maintenance(symbol, qty=vol, price=avg_price)
