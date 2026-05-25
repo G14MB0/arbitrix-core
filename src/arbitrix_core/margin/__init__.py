@@ -14,7 +14,7 @@ Public surface:
 """
 
 from arbitrix_core.margin.protocol import MarginModel, Money, MarginCallEvent
-from arbitrix_core.margin.models import NoMargin, FuturesUSDMargin
+from arbitrix_core.margin.models import NoMargin, FuturesUSDMargin, RegTMargin, CFDMargin
 
 __all__ = [
     "MarginModel",
@@ -22,4 +22,6 @@ __all__ = [
     "MarginCallEvent",
     "NoMargin",
     "FuturesUSDMargin",
+    "RegTMargin",
+    "CFDMargin",
 ]
