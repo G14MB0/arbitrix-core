@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
 import threading
@@ -113,19 +114,17 @@ class Portfolio:
         missing registry entry never crashes the equity loop. See
         Sub-spec 2 / Task 19 for the contract.
         """
-        from collections import defaultdict
-
         acc: Dict[str, List[float]] = defaultdict(lambda: [0.0, 0.0])  # [vol_sum, notional_sum]
         with self._lock:
             for trade in self._open_trades:
                 if trade.volume <= 0:
-                    continue
+                    continue  # paranoia: stale 0-volume trade post partial-close race
                 acc[trade.symbol][0] += float(trade.volume)
                 acc[trade.symbol][1] += float(trade.volume) * float(trade.entry_price)
         total = 0.0
         for symbol, (vol, notional) in acc.items():
             if vol <= 0:
-                continue
+                continue  # paranoia: stale 0-volume trade post partial-close race
             avg_price = notional / vol
             model = _margin_model_for_symbol(symbol)
             money = model.initial(symbol, qty=vol, price=avg_price)
