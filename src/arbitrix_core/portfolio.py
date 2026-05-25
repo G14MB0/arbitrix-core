@@ -79,6 +79,10 @@ class Portfolio:
         self._version = 0
         self._exposure_cache: Dict[Tuple[str, Optional[str], Optional[pd.Timestamp], int], Dict[str, Any]] = {}
         self._last_prices: Dict[str, float] = {}
+        # Portfolio-level margin cap, set by the engine at boot from
+        # :attr:`BTConfig.max_margin_utilization` (Sub-spec 2 / Task 20).
+        # Default 1.0 = no cap beyond per-symbol margin_available check.
+        self.max_margin_utilization: float = 1.0
 
     def _bump(self) -> None:
         self._version += 1
@@ -139,6 +143,39 @@ class Portfolio:
         per-symbol margin check (Sub-spec 2 / Task 19).
         """
         return self._equity - self.margin_used()
+
+    def can_open(self, symbol: str, qty: float, price: float) -> bool:
+        """Pre-submit gate. Returns True only if BOTH:
+
+        1. The new position's per-symbol initial margin
+           ``<= margin_available``.
+        2. ``(margin_used + new_margin) / equity <= max_margin_utilization``.
+
+        Either failure rejects the order. Unknown symbol falls back to
+        :class:`NoMargin` (zero margin contribution), so a missing
+        registry entry never blocks an order — that's a Sub-spec 1
+        hydration concern, not a margin check.
+
+        Edge case: if ``equity <= 0`` the ratio is undefined; we allow
+        only the trivial case where the projected used margin is also
+        zero (e.g. an unknown symbol). Any positive new margin is
+        rejected via check 1 since ``margin_available`` is non-positive.
+        """
+        model = _margin_model_for_symbol(symbol)
+        new_margin = model.initial(symbol, qty=qty, price=price).amount
+
+        # Check 1: per-symbol vs available cash margin.
+        if new_margin > self.margin_available():
+            return False
+
+        # Check 2: portfolio-level cap.
+        projected_used = self.margin_used() + new_margin
+        if self._equity <= 0:
+            return projected_used == 0.0
+        if projected_used / self._equity > self.max_margin_utilization:
+            return False
+
+        return True
 
     @property
     def last_update(self) -> Optional[pd.Timestamp]:
