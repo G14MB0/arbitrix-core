@@ -87,6 +87,7 @@ def clear_margin_params_registry() -> None:
         _PARAMS.clear()
 
 
+# Late imports: models.py imports protocol; top-level import here would cycle through __init__.py.
 from arbitrix_core.margin.models import (
     NoMargin, FuturesUSDMargin, RegTMargin, CFDMargin,
 )
