@@ -39,7 +39,13 @@ def _invoke_strategy_on_bar(strategy, row, portfolio, regime_output):
             ctx = get_symbol_context(strategy.symbol)
         except (KeyError, AttributeError):
             ctx = None
-        return strategy.on_bar(row, portfolio, regime_output, ctx=ctx)
+        # Only forward ``regime_output`` positionally when the override actually
+        # accepts it — strategies that opt into ``ctx`` but skip
+        # ``regime_output`` (e.g. ``on_bar(row, portfolio, ctx=None)``) would
+        # otherwise hit "multiple values for argument 'ctx'".
+        if "regime_output" in sig.parameters:
+            return strategy.on_bar(row, portfolio, regime_output, ctx=ctx)
+        return strategy.on_bar(row, portfolio, ctx=ctx)
     return invoke_strategy_on_bar(strategy, row, portfolio, regime_output)
 
 
