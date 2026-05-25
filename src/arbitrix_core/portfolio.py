@@ -4,11 +4,12 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
 import threading
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import pandas as pd
 
 from arbitrix_core.margin import (
+    MarginCallEvent,
     MarginParams,
     NoMargin,
     get_margin_params,
@@ -176,6 +177,43 @@ class Portfolio:
             return False
 
         return True
+
+    def check_maintenance_margin(self, ts: pd.Timestamp) -> Iterator[MarginCallEvent]:
+        """Yield one MarginCallEvent per open symbol when the *total* per-symbol
+        maintenance requirement across the book exceeds current equity.
+
+        Sub-spec 4 consumes these events to materialize a forced-flat order at
+        the next close. This function ONLY observes; it does NOT mutate state
+        or place orders.
+        """
+        acc: Dict[str, List[float]] = defaultdict(lambda: [0.0, 0.0])
+        with self._lock:
+            trades_snapshot = list(self._open_trades)
+        for trade in trades_snapshot:
+            if trade.volume <= 0:
+                continue
+            acc[trade.symbol][0] += float(trade.volume)
+            acc[trade.symbol][1] += float(trade.volume) * float(trade.entry_price)
+        per_symbol_maint: Dict[str, float] = {}
+        for symbol, (vol, notional) in acc.items():
+            if vol <= 0:
+                continue
+            avg_price = notional / vol
+            model = _margin_model_for_symbol(symbol)
+            money = model.maintenance(symbol, qty=vol, price=avg_price)
+            per_symbol_maint[symbol] = money.amount
+        total_maint = sum(per_symbol_maint.values())
+        if total_maint <= self._equity:
+            return
+        for symbol, maint in per_symbol_maint.items():
+            if maint <= 0.0:  # NoMargin fallback yields 0 → skip unknowns
+                continue
+            yield MarginCallEvent(
+                symbol=symbol,
+                equity=self._equity,
+                maintenance_required=total_maint,
+                ts=ts,
+            )
 
     @property
     def last_update(self) -> Optional[pd.Timestamp]:
