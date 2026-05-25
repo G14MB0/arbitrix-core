@@ -892,16 +892,19 @@ class Backtester:
         if volume <= 0:
             return None
 
-        if strategy.portfolio is not None and not strategy.portfolio.can_open(
-            symbol, qty=float(volume), price=float(row["close"])
-        ):
-            return None
-
         price: Optional[float] = None
         if signal.order_type == "limit":
             price = signal.limit_price if signal.limit_price is not None else signal.price
         elif signal.order_type == "stop":
             price = signal.stop_price if signal.stop_price is not None else signal.price
+
+        # Parity with live runtime `_resolve_entry_price`: gate on the order's
+        # actual entry price (limit/stop) when set; fall back to close for market.
+        gate_price = float(price) if price is not None else float(row["close"])
+        if strategy.portfolio is not None and not strategy.portfolio.can_open(
+            symbol, qty=float(volume), price=gate_price
+        ):
+            return None
 
         valid_until = self._resolve_valid_until(strategy, signal)
 
