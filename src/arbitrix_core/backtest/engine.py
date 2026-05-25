@@ -827,9 +827,24 @@ class Backtester:
         # the strategy can also set a risk_multiplier
         # that will be multiplied by the risk_perc
         # it's useful when the strategy want to module the risk but not calculating the position size
+        # ARB / Sub-spec 1: FUT contracts are indivisible — floor and skip when
+        # below min_order_size. Non-FUT keeps legacy round-to-2 behavior.
+        # See docs/risk/position-sizing.md for the rule.
         if volume is None:
             risk_dollars = equity * risk_perc * signal.risk_multiplier
-            volume = round(risk_dollars / (point_value * stop_points), 2)
+            raw = risk_dollars / (point_value * stop_points)
+            try:
+                from arbitrix_core.symbols.context import get_symbol_context
+                ctx = get_symbol_context(symbol)
+                if ctx.asset_class in ("futures", "futures_continuous"):
+                    floored = math.floor(max(raw, 0.0))
+                    if floored < ctx.min_order_size:
+                        return None
+                    volume = float(floored)
+                else:
+                    volume = round(raw, 2)
+            except (KeyError, ImportError):
+                volume = round(raw, 2)
         if volume <= 0:
             return None
 
