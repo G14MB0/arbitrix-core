@@ -57,3 +57,10 @@ class InstrumentConfig:
     commission_scheme: Optional[str] = None
     fee_per_contract: float = 0.0
     fee_min_per_order: float = 0.0
+    # --- Sub-spec 2 margin fields ---
+    margin_model_id: Optional[str] = None
+    margin_initial_per_contract: Optional[float] = None
+    margin_maintenance_per_contract: Optional[float] = None
+    margin_overnight_initial_per_contract: Optional[float] = None
+    margin_overnight_maintenance_per_contract: Optional[float] = None
+    margin_leverage: Optional[float] = None
