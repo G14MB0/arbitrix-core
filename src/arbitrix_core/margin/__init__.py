@@ -23,6 +23,7 @@ from arbitrix_core.margin.registry import (
     register_margin_params,
     get_margin_params,
     clear_margin_params_registry,
+    resolve_margin_model,
 )
 
 __all__ = [
@@ -31,4 +32,5 @@ __all__ = [
     "MarginParams",
     "default_margin_model_for",
     "register_margin_params", "get_margin_params", "clear_margin_params_registry",
+    "resolve_margin_model",
 ]

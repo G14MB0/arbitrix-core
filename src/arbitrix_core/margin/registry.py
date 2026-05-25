@@ -85,3 +85,47 @@ def clear_margin_params_registry() -> None:
     """Wipe the registry (test fixture helper, not a runtime API)."""
     with _LOCK:
         _PARAMS.clear()
+
+
+from arbitrix_core.margin.models import (
+    NoMargin, FuturesUSDMargin, RegTMargin, CFDMargin,
+)
+from arbitrix_core.margin.protocol import MarginModel
+
+
+def resolve_margin_model(params: MarginParams) -> MarginModel:
+    """Build a concrete MarginModel from a MarginParams payload.
+
+    Dispatches on ``params.model_id``. Defaults are applied per-model:
+
+    * ``nomargin`` → :class:`NoMargin` (no params used).
+    * ``futures_usd`` → :class:`FuturesUSDMargin`. ``initial_per_contract`` and
+      ``maintenance_per_contract`` are REQUIRED; raises ``ValueError`` if missing.
+    * ``regt`` → :class:`RegTMargin` (50%/25% defaults; params currently ignored
+      — operator overrides via custom ratios are a Sub-spec 3 concern).
+    * ``cfd_20x`` → :class:`CFDMargin`. Honors ``params.leverage`` if set,
+      else defaults to 20x.
+
+    Raises ``ValueError`` on unknown ``model_id``.
+    """
+    mid = params.model_id
+    if mid == "nomargin":
+        return NoMargin()
+    if mid == "futures_usd":
+        if params.initial_per_contract is None or params.maintenance_per_contract is None:
+            raise ValueError(
+                f"futures_usd MarginParams must include initial_per_contract "
+                f"and maintenance_per_contract; got {params}"
+            )
+        return FuturesUSDMargin(
+            initial_per_contract=params.initial_per_contract,
+            maintenance_per_contract=params.maintenance_per_contract,
+            overnight_initial_per_contract=params.overnight_initial_per_contract,
+            overnight_maintenance_per_contract=params.overnight_maintenance_per_contract,
+        )
+    if mid == "regt":
+        return RegTMargin()
+    if mid == "cfd_20x":
+        leverage = params.leverage if params.leverage is not None else 20.0
+        return CFDMargin(leverage=leverage)
+    raise ValueError(f"unknown margin model id: {mid!r}")
