@@ -735,8 +735,18 @@ class Portfolio:
         pending_orders = [order for order in self._pending_orders if order.symbol == symbol]
         open_volume = sum(trade.volume for trade in open_trades)
         closed_volume = sum(trade.volume for trade in closed_trades)
-        open_notional = sum(trade.entry_price * trade.volume for trade in open_trades)
-        closed_notional = sum(trade.entry_price * trade.volume for trade in closed_trades)
+        # ARB / Sub-spec 1: FUT notional = price × volume × multiplier. For
+        # non-FUT, multiplier == 1.0, so behavior is unchanged. See
+        # docs/symbols/futures.md for the rationale.
+        def _mult(sym: str) -> float:
+            try:
+                from arbitrix_core.symbols.context import get_symbol_context
+                return float(get_symbol_context(sym).multiplier)
+            except (KeyError, ImportError):
+                return 1.0
+        mult = _mult(symbol)
+        open_notional = sum(trade.entry_price * trade.volume * mult for trade in open_trades)
+        closed_notional = sum(trade.entry_price * trade.volume * mult for trade in closed_trades)
         pending_volume = sum(order.volume for order in pending_orders)
         return {
             "symbol": symbol,
