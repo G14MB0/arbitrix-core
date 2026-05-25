@@ -62,6 +62,9 @@ class BTConfig:
     intra_bar_model: str = "sl_first"  # "sl_first", "tp_first", "none"
     trailing_mode: str = "none"  # placeholder for future engine modes
     trailing_params: Dict[str, float] = field(default_factory=dict)
+    max_margin_utilization: float = 1.0
+    """Hard cap on margin_used / equity. 1.0 = no extra portfolio-level cap
+    (per-symbol margin check still runs). Set <1 for conservative buffer."""
 
 
 @dataclass

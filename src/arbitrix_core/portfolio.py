@@ -7,7 +7,29 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import pandas as pd
 
+from arbitrix_core.margin import (
+    MarginParams,
+    NoMargin,
+    get_margin_params,
+    resolve_margin_model,
+)
 from arbitrix_core.trading import Order, Trade
+
+
+def _margin_model_for_symbol(symbol: str):
+    """Resolve the per-symbol :class:`MarginModel`, falling back to
+    :class:`NoMargin` if the symbol isn't in the registry or its params
+    can't be resolved. Unknown symbol → zero margin contribution, so a
+    missing registry entry never crashes the equity loop.
+    """
+    try:
+        params = get_margin_params(symbol)
+    except KeyError:
+        return NoMargin()
+    try:
+        return resolve_margin_model(params)
+    except ValueError:
+        return NoMargin()
 
 
 def _normalize_ts(value: Optional[datetime | pd.Timestamp]) -> Optional[pd.Timestamp]:
@@ -56,6 +78,12 @@ class Portfolio:
         self._version = 0
         self._exposure_cache: Dict[Tuple[str, Optional[str], Optional[pd.Timestamp], int], Dict[str, Any]] = {}
         self._last_prices: Dict[str, float] = {}
+        # Per-symbol aggregated position view used by the margin model
+        # (Sub-spec 2). Maintained separately from ``_open_trades`` so margin
+        # accounting can query ``qty``/``avg_price`` without re-walking the
+        # trade list every bar. Seeded by trade lifecycle methods; tests may
+        # also seed it directly.
+        self._open_positions: Dict[str, Dict[str, float]] = {}
 
     def _bump(self) -> None:
         self._version += 1
@@ -80,6 +108,36 @@ class Portfolio:
     @property
     def initial_equity(self) -> float:
         return self._initial_equity
+
+    def margin_used(self) -> float:
+        """Sum of per-symbol :meth:`MarginModel.initial` across all open
+        positions in :attr:`_open_positions`.
+
+        Unknown symbols (no registry entry) contribute ``0.0`` via the
+        :class:`NoMargin` fallback in :func:`_margin_model_for_symbol`, so a
+        missing margin params row never crashes the equity loop. See
+        Sub-spec 2 / Task 19 for the contract.
+        """
+        total = 0.0
+        with self._lock:
+            for symbol, pos in self._open_positions.items():
+                model = _margin_model_for_symbol(symbol)
+                money = model.initial(
+                    symbol,
+                    qty=float(pos["qty"]),
+                    price=float(pos["avg_price"]),
+                )
+                total += money.amount
+        return total
+
+    def margin_available(self) -> float:
+        """``equity - margin_used``. Negative result means over-leveraged.
+
+        Compared against :attr:`BTConfig.max_margin_utilization` by the
+        engine; portfolio-level cap is enforced in addition to the
+        per-symbol margin check (Sub-spec 2 / Task 19).
+        """
+        return self._equity - self.margin_used()
 
     @property
     def last_update(self) -> Optional[pd.Timestamp]:
