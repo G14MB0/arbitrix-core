@@ -175,6 +175,7 @@ class Backtester:
             "pre_trade_s": 0.0,
             "stop_check_s": 0.0,
             "portfolio_sync_s": 0.0,
+            "margin_check_s": 0.0,
             "on_bar_s": 0.0,
             "apply_signals_s": 0.0,
             "expire_orders_s": 0.0,
@@ -420,8 +421,11 @@ class Backtester:
             if runtime_breakdown_enabled:
                 loop_breakdown["portfolio_sync_s"] += max(0.0, time.monotonic() - section_started)
 
+            section_started = time.monotonic() if runtime_breakdown_enabled else 0.0
             for _mce in portfolio.check_maintenance_margin(ts=ts):
                 margin_call_events.append(_mce)
+            if runtime_breakdown_enabled:
+                loop_breakdown["margin_check_s"] += max(0.0, time.monotonic() - section_started)
 
             section_started = time.monotonic() if runtime_breakdown_enabled else 0.0
             regime_output = None
@@ -888,8 +892,7 @@ class Backtester:
         if volume <= 0:
             return None
 
-        _portfolio = getattr(strategy, "portfolio", None)
-        if _portfolio is not None and not _portfolio.can_open(
+        if strategy.portfolio is not None and not strategy.portfolio.can_open(
             symbol, qty=float(volume), price=float(row["close"])
         ):
             return None
