@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 
 import arbitrix_core.costs as costs
+from arbitrix_core.margin import MarginCallEvent
 from arbitrix_core.portfolio import Portfolio
 from arbitrix_core.strategies.base import BaseStrategy, invoke_strategy_on_bar
 from arbitrix_core.trading import Order, Signal, Trade, Position
@@ -78,6 +79,7 @@ class BTResult:
     orders: List[Order] = field(default_factory=list)
     positions: List["Position"] = field(default_factory=list)
     prepared: Optional[pd.DataFrame] = None
+    margin_call_events: List[MarginCallEvent] = field(default_factory=list)
 
 
 class Backtester:
@@ -207,6 +209,7 @@ class Backtester:
                 start_filter = start_filter.tz_convert("UTC")
 
         portfolio = Portfolio(initial_equity=initial_equity, equity_source="backtest")
+        portfolio.max_margin_utilization = self.cfg.max_margin_utilization
         strategy.portfolio = portfolio
 
         # Log input data range for standard backtest
@@ -318,6 +321,7 @@ class Backtester:
         symbol = strategy.symbol or "SYMBOL"
         open_trades: List[Trade] = []
         closed_trades: List[Trade] = []
+        margin_call_events: List[MarginCallEvent] = []
         signal_intents: Optional[List[Dict[str, Any]]] = [] if collect_diagnostics else None
         working_orders: List[Order] = []
         all_orders: List[Order] = []
@@ -415,6 +419,9 @@ class Backtester:
             )
             if runtime_breakdown_enabled:
                 loop_breakdown["portfolio_sync_s"] += max(0.0, time.monotonic() - section_started)
+
+            for _mce in portfolio.check_maintenance_margin(ts=ts):
+                margin_call_events.append(_mce)
 
             section_started = time.monotonic() if runtime_breakdown_enabled else 0.0
             regime_output = None
@@ -819,6 +826,7 @@ class Backtester:
             orders=all_orders if collect_diagnostics else [],
             positions=self._final_positions(closed_trades) if collect_diagnostics else [],
             prepared=prepared_snapshot,
+            margin_call_events=margin_call_events,
         )
 
     def _unrealized_pnl(self, symbol: str, trades: List[Trade], row: pd.Series) -> float:
@@ -878,6 +886,12 @@ class Backtester:
             except (KeyError, ImportError):
                 volume = round(raw, 2)
         if volume <= 0:
+            return None
+
+        _portfolio = getattr(strategy, "portfolio", None)
+        if _portfolio is not None and not _portfolio.can_open(
+            symbol, qty=float(volume), price=float(row["close"])
+        ):
             return None
 
         price: Optional[float] = None
