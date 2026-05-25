@@ -180,7 +180,17 @@ class Portfolio:
 
     def check_maintenance_margin(self, ts: pd.Timestamp) -> Iterator[MarginCallEvent]:
         """Yield one MarginCallEvent per open symbol when the *total* per-symbol
-        maintenance requirement across the book exceeds current equity.
+        maintenance requirement across the book exceeds current mark-to-market
+        equity (``_equity_marked``, kept in sync per-bar by the engine via
+        ``portfolio.sync(..., equity_marked=...)`` after stop/order processing).
+
+        Reading MTM equity rather than realized equity lets adverse price moves
+        on open positions trigger a margin call before the position is closed —
+        which is the actual real-world behaviour. ``_equity_marked`` defaults to
+        ``_equity`` at construction and stays equal to it whenever no
+        mark-to-market price is available, so unit tests that seed only the
+        portfolio's open trades (no ``update_market`` calls) still trigger
+        identically.
 
         This function ONLY observes; it does NOT mutate state or place orders.
         """
@@ -201,14 +211,14 @@ class Portfolio:
             money = model.maintenance(symbol, qty=vol, price=avg_price)
             per_symbol_maint[symbol] = money.amount
         total_maint = sum(per_symbol_maint.values())
-        if total_maint <= self._equity:
+        if total_maint <= self._equity_marked:
             return
         for symbol, maint in per_symbol_maint.items():
             if maint <= 0.0:  # NoMargin fallback yields 0 → skip unknowns
                 continue
             yield MarginCallEvent(
                 symbol=symbol,
-                equity=self._equity,
+                equity=self._equity_marked,
                 maintenance_required=total_maint,
                 ts=ts,
             )
