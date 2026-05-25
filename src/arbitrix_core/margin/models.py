@@ -14,7 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-from arbitrix_core.margin.protocol import MarginModel, Money
+from arbitrix_core.margin.protocol import Money
 
 
 @dataclass(frozen=True)
