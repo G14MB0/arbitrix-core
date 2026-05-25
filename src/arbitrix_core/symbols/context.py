@@ -27,7 +27,6 @@ class SymbolContext:
     fee_per_contract: float
     fee_min_per_order: float
     min_order_size: float
-    margin_per_contract: Optional[float]  # populated by Sub-spec 2
 
 
 _REGISTRY: dict[str, SymbolContext] = {}
@@ -88,5 +87,4 @@ def build_symbol_context_from_instrument(
         fee_per_contract=float(inst.fee_per_contract or 0.0),
         fee_min_per_order=float(inst.fee_min_per_order or 0.0),
         min_order_size=float(inst.min_order_size or 1.0),
-        margin_per_contract=None,  # Sub-spec 2 populates
     )
