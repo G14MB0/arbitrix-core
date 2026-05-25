@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import logging
 import math
 import re
@@ -18,6 +19,28 @@ from arbitrix_core.trading import Order, Signal, Trade, Position
 from arbitrix_core.types import InstrumentConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _invoke_strategy_on_bar(strategy, row, portfolio, regime_output):
+    """ARB / Sub-spec 1: pass ctx when the strategy's on_bar accepts it; omit otherwise.
+
+    Backward-compatible: strategies whose ``on_bar`` was written before the
+    ``ctx`` arg keep working unchanged via :func:`invoke_strategy_on_bar` (which
+    additionally tolerates legacy two-argument signatures without
+    ``regime_output``). New code reads ``ctx`` for per-symbol metadata.
+    """
+    try:
+        sig = inspect.signature(strategy.on_bar)
+    except (TypeError, ValueError):
+        return invoke_strategy_on_bar(strategy, row, portfolio, regime_output)
+    if "ctx" in sig.parameters:
+        try:
+            from arbitrix_core.symbols.context import get_symbol_context
+            ctx = get_symbol_context(strategy.symbol)
+        except (KeyError, AttributeError):
+            ctx = None
+        return strategy.on_bar(row, portfolio, regime_output, ctx=ctx)
+    return invoke_strategy_on_bar(strategy, row, portfolio, regime_output)
 
 
 @dataclass
@@ -388,7 +411,7 @@ class Backtester:
             regime_output = None
             if isinstance(row, pd.Series):
                 regime_output = row.get("__regime_output__")
-            bar_signals = invoke_strategy_on_bar(strategy, row, portfolio, regime_output)
+            bar_signals = _invoke_strategy_on_bar(strategy, row, portfolio, regime_output)
             if runtime_breakdown_enabled:
                 loop_breakdown["on_bar_s"] += max(0.0, time.monotonic() - section_started)
             section_started = time.monotonic() if runtime_breakdown_enabled else 0.0

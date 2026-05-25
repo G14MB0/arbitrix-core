@@ -17,6 +17,7 @@ from arbitrix_core.trading import Signal
 
 if TYPE_CHECKING:
     from arbitrix_core.portfolio import Portfolio
+    from arbitrix_core.symbols.context import SymbolContext
 
 
 _ON_BAR_SIGNATURE_CACHE: Dict[type, bool] = {}
@@ -89,8 +90,15 @@ class BaseStrategy:
         row: pd.Series,
         portfolio: "Portfolio",
         regime_output: Any = None,
+        ctx: "SymbolContext | None" = None,
     ) -> list[Signal]:
-        """Called once per prepared bar in backtest and live modes."""
+        """Called once per prepared bar in backtest and live modes.
+
+        ARB / Sub-spec 1: ``ctx`` is the :class:`SymbolContext` for
+        ``self.symbol``. Engines pass it when the override accepts it; legacy
+        strategies (no ``ctx`` parameter) keep working via ``inspect``-based
+        dispatch in ``_invoke_strategy_on_bar``.
+        """
         return []
 
     @staticmethod
