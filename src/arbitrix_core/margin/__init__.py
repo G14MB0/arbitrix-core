@@ -14,14 +14,21 @@ Public surface:
 """
 
 from arbitrix_core.margin.protocol import MarginModel, Money, MarginCallEvent
-from arbitrix_core.margin.models import NoMargin, FuturesUSDMargin, RegTMargin, CFDMargin
+from arbitrix_core.margin.models import (
+    NoMargin, FuturesUSDMargin, RegTMargin, CFDMargin,
+)
+from arbitrix_core.margin.registry import (
+    MarginParams,
+    default_margin_model_for,
+    register_margin_params,
+    get_margin_params,
+    clear_margin_params_registry,
+)
 
 __all__ = [
-    "MarginModel",
-    "Money",
-    "MarginCallEvent",
-    "NoMargin",
-    "FuturesUSDMargin",
-    "RegTMargin",
-    "CFDMargin",
+    "MarginModel", "Money", "MarginCallEvent",
+    "NoMargin", "FuturesUSDMargin", "RegTMargin", "CFDMargin",
+    "MarginParams",
+    "default_margin_model_for",
+    "register_margin_params", "get_margin_params", "clear_margin_params_registry",
 ]
