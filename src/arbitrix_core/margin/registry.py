@@ -66,10 +66,10 @@ def register_margin_params(symbol: str, params: MarginParams) -> None:
 
     Symbol key is lower-cased internally; callers can pass any casing.
     """
-    if not isinstance(symbol, str) or not symbol:
+    if not isinstance(symbol, str) or not symbol.strip():
         raise ValueError("symbol must be a non-empty string")
     with _LOCK:
-        _PARAMS[symbol.lower()] = params
+        _PARAMS[symbol.strip().lower()] = params
 
 
 def get_margin_params(symbol: str) -> MarginParams:
