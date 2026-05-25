@@ -270,6 +270,15 @@ def _resolve_point_value(symbol: str) -> Optional[float]:
 
 
 def get_point_value(symbol: str) -> float:
+    # ARB / Sub-spec 1: prefer SymbolContext when registered; fall back to legacy
+    # provider/instrument/override chain so existing call sites keep working.
+    # See docs/symbols/futures.md for the registration model.
+    try:
+        from arbitrix_core.symbols.context import get_symbol_context
+        ctx = get_symbol_context(symbol)
+        return float(ctx.point_value)
+    except KeyError:
+        pass
     cache_key = str(symbol).lower()
     with _LOCK:
         cached = _POINT_VALUE_CACHE.get(cache_key)
