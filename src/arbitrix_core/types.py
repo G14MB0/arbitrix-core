@@ -64,3 +64,9 @@ class InstrumentConfig:
     margin_overnight_initial_per_contract: Optional[float] = None
     margin_overnight_maintenance_per_contract: Optional[float] = None
     margin_leverage: Optional[float] = None
+    # --- Sub-spec 3 per-symbol expiry threshold overrides ---
+    # When set, these override the ExpiryMonitor's global thresholds for this
+    # instrument. None means "use the monitor default".
+    expiry_threshold_t7_days: Optional[int] = None
+    expiry_threshold_t3_days: Optional[int] = None
+    expiry_threshold_t1_days: Optional[int] = None
