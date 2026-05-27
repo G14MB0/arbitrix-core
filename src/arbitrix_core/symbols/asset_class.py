@@ -12,6 +12,7 @@ _SECURITY_TYPE_TO_ASSET_CLASS: dict[str, AssetClass] = {
     "CASH": "fx",
     "FUT": "futures",
     "CONTFUT": "futures_continuous",
+    "CONTSTITCH": "futures_continuous",
 }
 
 
