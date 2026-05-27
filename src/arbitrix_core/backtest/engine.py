@@ -1194,18 +1194,6 @@ class Backtester:
             if not filtered_sig.is_entry():
                 continue
 
-            try:
-                from arbitrix_core.symbols.context import get_symbol_context
-                _ctx_sym = get_symbol_context(symbol)
-                if (_ctx_sym.asset_class or "").lower() == "futures_continuous":
-                    logger.warning(
-                        "CONTFUT signal on %s skipped (data-only symbol; use front-month FUT)",
-                        _ctx_sym.symbol,
-                    )
-                    continue
-            except KeyError:
-                pass
-
             order = self._create_order_from_signal(strategy, filtered_sig, row, risk_perc, equity)
             if order:
                 all_orders.append(order)
