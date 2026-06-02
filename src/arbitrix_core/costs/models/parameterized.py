@@ -55,7 +55,7 @@ def _spread_mode(params: Dict[str, Any]) -> str:
 def commission_one_side(symbol: str, price: float, volume_lot: float) -> float:
     params = _params(symbol)
     fixed_fee = _param_value(params, "commission_per_lot")
-    if fixed_fee is not None:
+    if fixed_fee is not None and fixed_fee > 0:
         commission = abs(volume_lot) * fixed_fee
         return max(commission, base.commission_minimum(volume_lot))
     notional = base.trade_notional(symbol, price, volume_lot)

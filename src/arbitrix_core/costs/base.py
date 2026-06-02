@@ -370,7 +370,7 @@ def _resolve_commission_scheme(symbol: str) -> Tuple[str, Dict[str, float]]:
       scheme in {"spread_only","bps","per_contract","per_lot_fixed"}
       params: dict with fields depending on scheme:
         - "bps": {"rate_bps": float, "min_commission": float}
-        - "per_contract": {"fee_per_contract": float, "contracts_per_lot": float, "per_block": float|None, "fee_per_block": float|None}
+        - "per_contract": {"fee_per_contract": float, "fee_min_per_order": float, "contracts_per_lot": float, "per_block": float|None, "fee_per_block": float|None}
         - "per_lot_fixed": {"fee_per_lot": float}
         - "spread_only": {}
     Priority: InstrumentConfig explicit fields > provider info hints > security_type defaults > fallback.
@@ -394,11 +394,13 @@ def _resolve_commission_scheme(symbol: str) -> Tuple[str, Dict[str, float]]:
 
     if scheme == "per_contract":
         fee_per_contract = float(getattr(inst, "fee_per_contract", 0.0) or 0.0)
+        fee_min_per_order = float(getattr(inst, "fee_min_per_order", 0.0) or 0.0)
         per_block = _as_float(getattr(inst, "per_contract_block", None))
         fee_per_block = _as_float(getattr(inst, "fee_per_block", None))
-        cpl = _as_float(getattr(inst, "contracts_per_lot", None)) or _contracts_per_lot_from_info(info) or 1.0
+        cpl = _as_float(getattr(inst, "contracts_per_lot", None)) or 1.0
         return "per_contract", {
             "fee_per_contract": max(fee_per_contract, 0.0),
+            "fee_min_per_order": max(fee_min_per_order, 0.0),
             "contracts_per_lot": max(cpl, 0.0) or 1.0,
             "per_block": per_block or 0.0,
             "fee_per_block": fee_per_block or 0.0,
@@ -431,6 +433,7 @@ def _resolve_commission_scheme(symbol: str) -> Tuple[str, Dict[str, float]]:
         fee_per_block = _as_float(info.get("commission_fee_per_block"))
         return "per_contract", {
             "fee_per_contract": float(fee_per_contract),
+            "fee_min_per_order": float(_as_float(info.get("fee_min_per_order") or info.get("minimum_commission")) or 0.0),
             "contracts_per_lot": float(cpl),
             "per_block": float(per_block or 0.0),
             "fee_per_block": float(fee_per_block or 0.0),
@@ -481,6 +484,7 @@ def commission_from_notional(
         cpl = float(p.get("contracts_per_lot", 1.0)) or 1.0
         per_block = float(p.get("per_block", 0.0))
         fee_per_block = float(p.get("fee_per_block", 0.0))
+        min_c = float(p.get("fee_min_per_order", 0.0))
 
         contracts = abs(volume_lot) * cpl
         if per_block and fee_per_block:
@@ -489,6 +493,7 @@ def commission_from_notional(
             commission = blocks * fee_per_block
         else:
             commission = contracts * fee_per_contract
+        commission = max(commission, min_c)
 
     elif scheme == "per_lot_fixed":
         fee_per_lot = float(p.get("fee_per_lot", get_commission_per_lot()))

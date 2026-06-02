@@ -960,10 +960,7 @@ class Backtester:
         equity: float,
     ) -> tuple[Optional[Trade], float]:
         commission = costs.commission_one_side(symbol, float(fill_price), order.volume)
-        spread_points = float(row.get("spread", 0.0)) if self.cfg.apply_spread_cost else 0.0
-        if pd.isna(spread_points):
-            spread_points = 0.0
-        spread_cost = costs.spread_cost(symbol, spread_points / 2.0, order.volume) if self.cfg.apply_spread_cost else 0.0
+        spread_cost = self._half_spread_cost(symbol, row, order.volume)
         slippage_points = self._slippage_points(symbol, row)
         slippage_cost_val = costs.slippage_cost(symbol, slippage_points, order.volume)
         equity -= commission + spread_cost + slippage_cost_val
@@ -1044,14 +1041,16 @@ class Backtester:
                 pnl = (trade.entry_price - fill) * pv * trade.volume
 
         commission = costs.commission_one_side(symbol, float(fill), trade.volume)
+        spread_cost = self._half_spread_cost(symbol, row, trade.volume)
         slippage_points = self._slippage_points(symbol, row)
         slippage_cost_val = costs.slippage_cost(symbol, slippage_points, trade.volume)
         trade.exit_time = ts
         trade.exit_price = float(fill)
         trade.gross_pnl = pnl
         trade.commission_paid += commission
+        trade.spread_cost += spread_cost
         trade.slippage_cost += slippage_cost_val
-        trade.pnl = pnl - commission - slippage_cost_val
+        trade.pnl = pnl - commission - spread_cost - slippage_cost_val
         total_costs = trade.commission_paid + trade.spread_cost + trade.slippage_cost
         trade.net_pnl = trade.gross_pnl - total_costs + trade.swap_pnl
         trade.notes["exit_stop"] = 1.0 if stop_hit else 0.0
@@ -1125,6 +1124,7 @@ class Backtester:
                 pnl = (trade.entry_price - fill) * pv * trade.volume
 
             commission = costs.commission_one_side(symbol, fill, trade.volume)
+            spread_cost = self._half_spread_cost(symbol, row, trade.volume)
             slippage_pts = self._slippage_points(symbol, row)
             slippage_cost_val = costs.slippage_cost(symbol, slippage_pts, trade.volume)
 
@@ -1132,8 +1132,9 @@ class Backtester:
             trade.exit_price = fill
             trade.gross_pnl = pnl
             trade.commission_paid += commission
+            trade.spread_cost += spread_cost
             trade.slippage_cost += slippage_cost_val
-            trade.pnl = pnl - commission - slippage_cost_val
+            trade.pnl = pnl - commission - spread_cost - slippage_cost_val
             total_costs = trade.commission_paid + trade.spread_cost + trade.slippage_cost
             trade.net_pnl = trade.gross_pnl - total_costs + trade.swap_pnl
             trade.notes["exit_stop"] = 1.0 if is_stop[i] else 0.0
@@ -1259,14 +1260,16 @@ class Backtester:
         else:
             pnl = (trade.entry_price - fill_price) * pv * trade.volume
         commission = costs.commission_one_side(symbol, float(fill_price), trade.volume)
+        spread_cost = self._half_spread_cost(symbol, row, trade.volume)
         slippage_points = self._slippage_points(symbol, row)
         slippage_cost_val = costs.slippage_cost(symbol, slippage_points, trade.volume)
         trade.exit_time = ts
         trade.exit_price = float(fill_price)
         trade.gross_pnl = pnl
         trade.commission_paid += commission
+        trade.spread_cost += spread_cost
         trade.slippage_cost += slippage_cost_val
-        trade.pnl = pnl - commission - slippage_cost_val
+        trade.pnl = pnl - commission - spread_cost - slippage_cost_val
         total_costs = trade.commission_paid + trade.spread_cost + trade.slippage_cost
         trade.net_pnl = trade.gross_pnl - total_costs + trade.swap_pnl
         trade.notes[f"exit_{reason}"] = 1.0
@@ -1403,6 +1406,7 @@ class Backtester:
         entry_swap = trade.swap_pnl * entry_ratio
 
         close_commission = costs.commission_one_side(symbol, float(fill_price), target)
+        close_spread = self._half_spread_cost(symbol, row, target)
         slippage_points = self._slippage_points(symbol, row)
         close_slippage = costs.slippage_cost(symbol, slippage_points, target)
 
@@ -1415,7 +1419,7 @@ class Backtester:
             stop_points=trade.stop_points,
             take_points=trade.take_points,
             commission_paid=entry_commission + close_commission,
-            spread_cost=entry_spread,
+            spread_cost=entry_spread + close_spread,
             slippage_cost=entry_slippage + close_slippage,
             swap_pnl=entry_swap,
             order_id=trade.order_id,
@@ -1454,6 +1458,23 @@ class Backtester:
         if self.cfg.slippage_atr_multiplier > 0 and "atr" in row and not pd.isna(row["atr"]):
             base += float(row["atr"]) * self.cfg.slippage_atr_multiplier
         return base if base else 0.0
+
+    def _spread_points(self, row: pd.Series) -> float:
+        if not self.cfg.apply_spread_cost:
+            return 0.0
+        try:
+            spread_points = float(row.get("spread", 0.0))
+        except (TypeError, ValueError):
+            return 0.0
+        if pd.isna(spread_points):
+            return 0.0
+        return max(spread_points, 0.0)
+
+    def _half_spread_cost(self, symbol: str, row: pd.Series, volume: float) -> float:
+        spread_points = self._spread_points(row)
+        if spread_points <= 0.0:
+            return 0.0
+        return costs.spread_cost(symbol, spread_points, volume) / 2.0
 
     def _tick_size(self, symbol: str) -> float:
         inst = self.instruments.get(symbol)
