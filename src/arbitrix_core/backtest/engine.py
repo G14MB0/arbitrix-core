@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 
 import arbitrix_core.costs as costs
+from arbitrix_core.backtest.bar_view import BarViewSource
 from arbitrix_core.margin import MarginCallEvent
 from arbitrix_core.portfolio import Portfolio
 from arbitrix_core.strategies.base import BaseStrategy, invoke_strategy_on_bar
@@ -20,6 +21,42 @@ from arbitrix_core.trading import Order, Signal, Trade, Position
 from arbitrix_core.types import InstrumentConfig
 
 logger = logging.getLogger(__name__)
+
+
+_ON_BAR_DISPATCH_CACHE: Dict[type, tuple[bool, bool]] = {}
+
+
+def _on_bar_dispatch_capabilities(strategy) -> Optional[tuple[bool, bool]]:
+    cls = strategy.__class__
+    cached = _ON_BAR_DISPATCH_CACHE.get(cls)
+    if cached is not None:
+        return cached
+    try:
+        sig = inspect.signature(strategy.on_bar)
+    except (TypeError, ValueError):
+        return None
+
+    accepts_ctx = "ctx" in sig.parameters
+    accepts_regime_output = False
+    positional = 0
+    for param in sig.parameters.values():
+        if param.kind == inspect.Parameter.VAR_POSITIONAL:
+            accepts_regime_output = True
+            break
+        if param.kind in {
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        }:
+            positional += 1
+        if param.kind == inspect.Parameter.KEYWORD_ONLY and param.name == "regime_output":
+            accepts_regime_output = True
+            break
+    if not accepts_regime_output:
+        accepts_regime_output = positional >= 3
+
+    cached = (accepts_ctx, accepts_regime_output)
+    _ON_BAR_DISPATCH_CACHE[cls] = cached
+    return cached
 
 
 def _invoke_strategy_on_bar(strategy, row, portfolio, regime_output):
@@ -30,11 +67,12 @@ def _invoke_strategy_on_bar(strategy, row, portfolio, regime_output):
     additionally tolerates legacy two-argument signatures without
     ``regime_output``). New code reads ``ctx`` for per-symbol metadata.
     """
-    try:
-        sig = inspect.signature(strategy.on_bar)
-    except (TypeError, ValueError):
+    capabilities = _on_bar_dispatch_capabilities(strategy)
+    if capabilities is None:
         return invoke_strategy_on_bar(strategy, row, portfolio, regime_output)
-    if "ctx" in sig.parameters:
+
+    accepts_ctx, accepts_regime_output = capabilities
+    if accepts_ctx:
         try:
             from arbitrix_core.symbols.context import get_symbol_context
             ctx = get_symbol_context(strategy.symbol)
@@ -44,10 +82,13 @@ def _invoke_strategy_on_bar(strategy, row, portfolio, regime_output):
         # accepts it — strategies that opt into ``ctx`` but skip
         # ``regime_output`` (e.g. ``on_bar(row, portfolio, ctx=None)``) would
         # otherwise hit "multiple values for argument 'ctx'".
-        if "regime_output" in sig.parameters:
+        if accepts_regime_output:
             return strategy.on_bar(row, portfolio, regime_output, ctx=ctx)
         return strategy.on_bar(row, portfolio, ctx=ctx)
-    return invoke_strategy_on_bar(strategy, row, portfolio, regime_output)
+
+    if accepts_regime_output:
+        return strategy.on_bar(row, portfolio, regime_output)
+    return strategy.on_bar(row, portfolio)
 
 
 @dataclass
@@ -66,6 +107,7 @@ class BTConfig:
     max_margin_utilization: float = 1.0
     """Hard cap on margin_used / equity. 1.0 = no extra portfolio-level cap
     (per-symbol margin check still runs). Set <1 for conservative buffer."""
+    row_mode: str = "series"  # "series" or "bar_view"
 
 
 @dataclass
@@ -373,10 +415,18 @@ class Backtester:
 
         loop_started = time.monotonic()
         prepared_len = len(prepared)
+        row_mode = str(getattr(self.cfg, "row_mode", "series") or "series").strip().lower()
+        if row_mode not in {"series", "bar_view"}:
+            raise ValueError("BTConfig.row_mode must be 'series' or 'bar_view'.")
         prepared_iloc = prepared.iloc
+        bar_view_source = BarViewSource(prepared) if row_mode == "bar_view" else None
         unrealized_pnl_fn = self._unrealized_pnl
         for row_idx in range(prepared_len):
-            row = prepared_iloc[row_idx]
+            row = (
+                bar_view_source.row_at(row_idx)
+                if bar_view_source is not None
+                else prepared_iloc[row_idx]
+            )
             control_started = time.monotonic() if runtime_breakdown_enabled else 0.0
             if row_idx % cancel_check_interval == 0:
                 _maybe_cancel()
@@ -429,7 +479,7 @@ class Backtester:
 
             section_started = time.monotonic() if runtime_breakdown_enabled else 0.0
             regime_output = None
-            if isinstance(row, pd.Series):
+            if hasattr(row, "get"):
                 regime_output = row.get("__regime_output__")
             bar_signals = _invoke_strategy_on_bar(strategy, row, portfolio, regime_output)
             if runtime_breakdown_enabled:
@@ -1216,12 +1266,12 @@ class Backtester:
                 return None
             return float(numeric)
 
-        provider_spread = _float_or_none(row.get("spread")) if isinstance(row, pd.Series) else None
+        provider_spread = _float_or_none(row.get("spread")) if hasattr(row, "get") else None
         price = (
             _float_or_none(signal.price)
             or _float_or_none(signal.limit_price)
             or _float_or_none(signal.stop_price)
-            or _float_or_none(row.get("close") if isinstance(row, pd.Series) else None)
+            or _float_or_none(row.get("close") if hasattr(row, "get") else None)
             or 0.0
         )
         volume = abs(_float_or_none(signal.volume) or 1.0)
