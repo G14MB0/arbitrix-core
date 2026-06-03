@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import inspect
+
 import pandas as pd
 
 from arbitrix_core import costs
@@ -17,6 +19,23 @@ class _NoopStrategy(BaseStrategy):
         return df
 
     def on_bar(self, row, portfolio, regime_output=None):
+        return []
+
+
+class _DispatchCacheStrategy(BaseStrategy):
+    name = "dispatch-cache"
+    symbol = "X"
+    timeframe = "M1"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.bars_seen = 0
+
+    def prepare(self, df):
+        return df
+
+    def on_bar(self, row, portfolio, regime_output=None):
+        self.bars_seen += 1
         return []
 
 
@@ -102,6 +121,33 @@ def test_bar_observer_called_once_per_bar():
     assert len(seen) == 10
     assert seen[0] == pd.Timestamp("2025-06-02T00:00:00Z")
     assert seen[-1] == pd.Timestamp("2025-06-02T00:09:00Z")
+
+
+def test_on_bar_signature_is_cached_per_strategy_class(monkeypatch):
+    import arbitrix_core.backtest.engine as engine_module
+    from arbitrix_core.strategies import base as strategy_base
+
+    strategy_base._ON_BAR_SIGNATURE_CACHE.clear()
+    if hasattr(engine_module, "_ON_BAR_DISPATCH_CACHE"):
+        engine_module._ON_BAR_DISPATCH_CACHE.clear()
+
+    original_signature = inspect.signature
+    signature_calls = 0
+
+    def counting_signature(obj):
+        nonlocal signature_calls
+        if getattr(obj, "__name__", "") == "on_bar":
+            signature_calls += 1
+        return original_signature(obj)
+
+    monkeypatch.setattr(inspect, "signature", counting_signature)
+
+    strategy = _DispatchCacheStrategy()
+    bt = Backtester(BTConfig(commission_per_lot=0.0, apply_swap_cost=False))
+    bt.run_single(_df(), strategy, risk_perc=0.005, initial_equity=10_000.0)
+
+    assert strategy.bars_seen == len(_df())
+    assert signature_calls <= 2
 
 
 def test_bar_observer_default_none_is_no_op():

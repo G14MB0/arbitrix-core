@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+- Removed `filter_signal` strategy hook. `on_bar` is now the sole entry point.
+
 ## [0.1.1] - 2026-04-29
 
 ### Fixed
@@ -15,7 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Initial open-source release extracted from the Arbitrix monorepo.
 - `Backtester` engine with batch-mode `run_single` API.
-- `BaseStrategy` with `generate_signals`, `filter_signal`, `on_bar` hooks.
+- `BaseStrategy` with `on_bar` as the sole strategy hook.
 - Default cost model with commission, spread, slippage, swap components,
   configurable via `costs.configure(...)`.
 - User-pluggable cost models via `costs.configure(model_identifier=...)`.

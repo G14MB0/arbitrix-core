@@ -55,6 +55,10 @@ nav:
   - Data format: data-format.md
   - Strategies: strategies.md
   - Cost models: costs.md
+  - Symbols:
+      - Futures: symbols/futures.md
+  - Risk:
+      - Position sizing: risk/position-sizing.md
   - Configuration: configuration.md
   - API reference:
       - Backtest: api/backtest.md

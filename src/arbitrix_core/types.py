@@ -48,3 +48,25 @@ class InstrumentConfig:
     # 1 share for a stock). Used by the live executor to decide whether a
     # partial-close residual is too small to resize a protective leg to (ARB-96).
     min_order_size: Optional[float] = None
+    # ARB / Sub-spec 1: per-symbol classification used by every engine consumer.
+    # asset_class is the canonical taxonomy; None on load means "auto-classify
+    # from security_type via symbols.asset_class.classify_asset_class".
+    asset_class: Optional[str] = None
+    # commission_scheme + fee fields unlock the `per_contract` path in
+    # costs/base.py:_resolve_commission_scheme. None preserves legacy behavior.
+    commission_scheme: Optional[str] = None
+    fee_per_contract: float = 0.0
+    fee_min_per_order: float = 0.0
+    # --- Sub-spec 2 margin fields ---
+    margin_model_id: Optional[str] = None
+    margin_initial_per_contract: Optional[float] = None
+    margin_maintenance_per_contract: Optional[float] = None
+    margin_overnight_initial_per_contract: Optional[float] = None
+    margin_overnight_maintenance_per_contract: Optional[float] = None
+    margin_leverage: Optional[float] = None
+    # --- Sub-spec 3 per-symbol expiry threshold overrides ---
+    # When set, these override the ExpiryMonitor's global thresholds for this
+    # instrument. None means "use the monitor default".
+    expiry_threshold_t7_days: Optional[int] = None
+    expiry_threshold_t3_days: Optional[int] = None
+    expiry_threshold_t1_days: Optional[int] = None

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import logging
 import math
 import re
@@ -12,12 +13,82 @@ import numpy as np
 import pandas as pd
 
 import arbitrix_core.costs as costs
+from arbitrix_core.backtest.bar_view import BarViewSource
+from arbitrix_core.margin import MarginCallEvent
 from arbitrix_core.portfolio import Portfolio
 from arbitrix_core.strategies.base import BaseStrategy, invoke_strategy_on_bar
 from arbitrix_core.trading import Order, Signal, Trade, Position
 from arbitrix_core.types import InstrumentConfig
 
 logger = logging.getLogger(__name__)
+
+
+_ON_BAR_DISPATCH_CACHE: Dict[type, tuple[bool, bool]] = {}
+
+
+def _on_bar_dispatch_capabilities(strategy) -> Optional[tuple[bool, bool]]:
+    cls = strategy.__class__
+    cached = _ON_BAR_DISPATCH_CACHE.get(cls)
+    if cached is not None:
+        return cached
+    try:
+        sig = inspect.signature(strategy.on_bar)
+    except (TypeError, ValueError):
+        return None
+
+    accepts_ctx = "ctx" in sig.parameters
+    accepts_regime_output = False
+    positional = 0
+    for param in sig.parameters.values():
+        if param.kind == inspect.Parameter.VAR_POSITIONAL:
+            accepts_regime_output = True
+            break
+        if param.kind in {
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        }:
+            positional += 1
+        if param.kind == inspect.Parameter.KEYWORD_ONLY and param.name == "regime_output":
+            accepts_regime_output = True
+            break
+    if not accepts_regime_output:
+        accepts_regime_output = positional >= 3
+
+    cached = (accepts_ctx, accepts_regime_output)
+    _ON_BAR_DISPATCH_CACHE[cls] = cached
+    return cached
+
+
+def _invoke_strategy_on_bar(strategy, row, portfolio, regime_output):
+    """ARB / Sub-spec 1: pass ctx when the strategy's on_bar accepts it; omit otherwise.
+
+    Backward-compatible: strategies whose ``on_bar`` was written before the
+    ``ctx`` arg keep working unchanged via :func:`invoke_strategy_on_bar` (which
+    additionally tolerates legacy two-argument signatures without
+    ``regime_output``). New code reads ``ctx`` for per-symbol metadata.
+    """
+    capabilities = _on_bar_dispatch_capabilities(strategy)
+    if capabilities is None:
+        return invoke_strategy_on_bar(strategy, row, portfolio, regime_output)
+
+    accepts_ctx, accepts_regime_output = capabilities
+    if accepts_ctx:
+        try:
+            from arbitrix_core.symbols.context import get_symbol_context
+            ctx = get_symbol_context(strategy.symbol)
+        except (KeyError, AttributeError):
+            ctx = None
+        # Only forward ``regime_output`` positionally when the override actually
+        # accepts it — strategies that opt into ``ctx`` but skip
+        # ``regime_output`` (e.g. ``on_bar(row, portfolio, ctx=None)``) would
+        # otherwise hit "multiple values for argument 'ctx'".
+        if accepts_regime_output:
+            return strategy.on_bar(row, portfolio, regime_output, ctx=ctx)
+        return strategy.on_bar(row, portfolio, ctx=ctx)
+
+    if accepts_regime_output:
+        return strategy.on_bar(row, portfolio, regime_output)
+    return strategy.on_bar(row, portfolio)
 
 
 @dataclass
@@ -33,6 +104,10 @@ class BTConfig:
     intra_bar_model: str = "sl_first"  # "sl_first", "tp_first", "none"
     trailing_mode: str = "none"  # placeholder for future engine modes
     trailing_params: Dict[str, float] = field(default_factory=dict)
+    max_margin_utilization: float = 1.0
+    """Hard cap on margin_used / equity. 1.0 = no extra portfolio-level cap
+    (per-symbol margin check still runs). Set <1 for conservative buffer."""
+    row_mode: str = "series"  # "series" or "bar_view"
 
 
 @dataclass
@@ -46,6 +121,7 @@ class BTResult:
     orders: List[Order] = field(default_factory=list)
     positions: List["Position"] = field(default_factory=list)
     prepared: Optional[pd.DataFrame] = None
+    margin_call_events: List[MarginCallEvent] = field(default_factory=list)
 
 
 class Backtester:
@@ -141,6 +217,7 @@ class Backtester:
             "pre_trade_s": 0.0,
             "stop_check_s": 0.0,
             "portfolio_sync_s": 0.0,
+            "margin_check_s": 0.0,
             "on_bar_s": 0.0,
             "apply_signals_s": 0.0,
             "expire_orders_s": 0.0,
@@ -175,6 +252,7 @@ class Backtester:
                 start_filter = start_filter.tz_convert("UTC")
 
         portfolio = Portfolio(initial_equity=initial_equity, equity_source="backtest")
+        portfolio.max_margin_utilization = self.cfg.max_margin_utilization
         strategy.portfolio = portfolio
 
         # Log input data range for standard backtest
@@ -286,6 +364,7 @@ class Backtester:
         symbol = strategy.symbol or "SYMBOL"
         open_trades: List[Trade] = []
         closed_trades: List[Trade] = []
+        margin_call_events: List[MarginCallEvent] = []
         signal_intents: Optional[List[Dict[str, Any]]] = [] if collect_diagnostics else None
         working_orders: List[Order] = []
         all_orders: List[Order] = []
@@ -336,10 +415,18 @@ class Backtester:
 
         loop_started = time.monotonic()
         prepared_len = len(prepared)
+        row_mode = str(getattr(self.cfg, "row_mode", "series") or "series").strip().lower()
+        if row_mode not in {"series", "bar_view"}:
+            raise ValueError("BTConfig.row_mode must be 'series' or 'bar_view'.")
         prepared_iloc = prepared.iloc
+        bar_view_source = BarViewSource(prepared) if row_mode == "bar_view" else None
         unrealized_pnl_fn = self._unrealized_pnl
         for row_idx in range(prepared_len):
-            row = prepared_iloc[row_idx]
+            row = (
+                bar_view_source.row_at(row_idx)
+                if bar_view_source is not None
+                else prepared_iloc[row_idx]
+            )
             control_started = time.monotonic() if runtime_breakdown_enabled else 0.0
             if row_idx % cancel_check_interval == 0:
                 _maybe_cancel()
@@ -385,10 +472,16 @@ class Backtester:
                 loop_breakdown["portfolio_sync_s"] += max(0.0, time.monotonic() - section_started)
 
             section_started = time.monotonic() if runtime_breakdown_enabled else 0.0
+            for _mce in portfolio.check_maintenance_margin(ts=ts):
+                margin_call_events.append(_mce)
+            if runtime_breakdown_enabled:
+                loop_breakdown["margin_check_s"] += max(0.0, time.monotonic() - section_started)
+
+            section_started = time.monotonic() if runtime_breakdown_enabled else 0.0
             regime_output = None
-            if isinstance(row, pd.Series):
+            if hasattr(row, "get"):
                 regime_output = row.get("__regime_output__")
-            bar_signals = invoke_strategy_on_bar(strategy, row, portfolio, regime_output)
+            bar_signals = _invoke_strategy_on_bar(strategy, row, portfolio, regime_output)
             if runtime_breakdown_enabled:
                 loop_breakdown["on_bar_s"] += max(0.0, time.monotonic() - section_started)
             section_started = time.monotonic() if runtime_breakdown_enabled else 0.0
@@ -425,6 +518,11 @@ class Backtester:
             # Attempt fills
             section_started = time.monotonic() if runtime_breakdown_enabled else 0.0
             newly_filled: List[Trade] = []
+            # ARB-129 iter-5: parallel list of source Orders for each filled
+            # Trade, exposed via the bar_observer ctx so the parity ledger
+            # emitter can record the actual Order.type on the entry
+            # OrderRecord (the Trade alone does not carry order_type).
+            newly_filled_orders: List[Order] = []
             remaining_orders: List[Order] = []
             for order in working_orders:
                 filled = self._try_fill_order(order, row)
@@ -434,6 +532,7 @@ class Backtester:
                 trade, equity = self._open_trade_from_order(symbol, order, filled, row, equity)
                 if trade:
                     newly_filled.append(trade)
+                    newly_filled_orders.append(order)
             working_orders = remaining_orders
             open_trades.extend(newly_filled)
             if runtime_breakdown_enabled:
@@ -471,6 +570,12 @@ class Backtester:
                         "gross_equity": float(gross_equity),
                         "bar_signals": list(bar_signals) if bar_signals else [],
                         "newly_filled": list(newly_filled),
+                        # ARB-129 iter-5: parallel to newly_filled, exposes the
+                        # source Order for each filled Trade so observers can
+                        # read Order.type / Order.price. Backwards-compatible:
+                        # existing observers that ignore unknown keys are
+                        # unaffected.
+                        "newly_filled_orders": list(newly_filled_orders),
                     }
                 )
 
@@ -775,6 +880,7 @@ class Backtester:
             orders=all_orders if collect_diagnostics else [],
             positions=self._final_positions(closed_trades) if collect_diagnostics else [],
             prepared=prepared_snapshot,
+            margin_call_events=margin_call_events,
         )
 
     def _unrealized_pnl(self, symbol: str, trades: List[Trade], row: pd.Series) -> float:
@@ -815,9 +921,24 @@ class Backtester:
         # the strategy can also set a risk_multiplier
         # that will be multiplied by the risk_perc
         # it's useful when the strategy want to module the risk but not calculating the position size
+        # ARB / Sub-spec 1: FUT contracts are indivisible — floor and skip when
+        # below min_order_size. Non-FUT keeps legacy round-to-2 behavior.
+        # See docs/risk/position-sizing.md for the rule.
         if volume is None:
             risk_dollars = equity * risk_perc * signal.risk_multiplier
-            volume = round(risk_dollars / (point_value * stop_points), 2)
+            raw = risk_dollars / (point_value * stop_points)
+            try:
+                from arbitrix_core.symbols.context import get_symbol_context
+                ctx = get_symbol_context(symbol)
+                if ctx.asset_class in ("futures", "futures_continuous"):
+                    floored = math.floor(max(raw, 0.0))
+                    if floored < ctx.min_order_size:
+                        return None
+                    volume = float(floored)
+                else:
+                    volume = round(raw, 2)
+            except (KeyError, ImportError):
+                volume = round(raw, 2)
         if volume <= 0:
             return None
 
@@ -826,6 +947,14 @@ class Backtester:
             price = signal.limit_price if signal.limit_price is not None else signal.price
         elif signal.order_type == "stop":
             price = signal.stop_price if signal.stop_price is not None else signal.price
+
+        # Parity with live runtime `_resolve_entry_price`: gate on the order's
+        # actual entry price (limit/stop) when set; fall back to close for market.
+        gate_price = float(price) if price is not None else float(row["close"])
+        if strategy.portfolio is not None and not strategy.portfolio.can_open(
+            symbol, qty=float(volume), price=gate_price
+        ):
+            return None
 
         valid_until = self._resolve_valid_until(strategy, signal)
 
@@ -881,10 +1010,7 @@ class Backtester:
         equity: float,
     ) -> tuple[Optional[Trade], float]:
         commission = costs.commission_one_side(symbol, float(fill_price), order.volume)
-        spread_points = float(row.get("spread", 0.0)) if self.cfg.apply_spread_cost else 0.0
-        if pd.isna(spread_points):
-            spread_points = 0.0
-        spread_cost = costs.spread_cost(symbol, spread_points / 2.0, order.volume) if self.cfg.apply_spread_cost else 0.0
+        spread_cost = self._half_spread_cost(symbol, row, order.volume)
         slippage_points = self._slippage_points(symbol, row)
         slippage_cost_val = costs.slippage_cost(symbol, slippage_points, order.volume)
         equity -= commission + spread_cost + slippage_cost_val
@@ -965,14 +1091,16 @@ class Backtester:
                 pnl = (trade.entry_price - fill) * pv * trade.volume
 
         commission = costs.commission_one_side(symbol, float(fill), trade.volume)
+        spread_cost = self._half_spread_cost(symbol, row, trade.volume)
         slippage_points = self._slippage_points(symbol, row)
         slippage_cost_val = costs.slippage_cost(symbol, slippage_points, trade.volume)
         trade.exit_time = ts
         trade.exit_price = float(fill)
         trade.gross_pnl = pnl
         trade.commission_paid += commission
+        trade.spread_cost += spread_cost
         trade.slippage_cost += slippage_cost_val
-        trade.pnl = pnl - commission - slippage_cost_val
+        trade.pnl = pnl - commission - spread_cost - slippage_cost_val
         total_costs = trade.commission_paid + trade.spread_cost + trade.slippage_cost
         trade.net_pnl = trade.gross_pnl - total_costs + trade.swap_pnl
         trade.notes["exit_stop"] = 1.0 if stop_hit else 0.0
@@ -1046,6 +1174,7 @@ class Backtester:
                 pnl = (trade.entry_price - fill) * pv * trade.volume
 
             commission = costs.commission_one_side(symbol, fill, trade.volume)
+            spread_cost = self._half_spread_cost(symbol, row, trade.volume)
             slippage_pts = self._slippage_points(symbol, row)
             slippage_cost_val = costs.slippage_cost(symbol, slippage_pts, trade.volume)
 
@@ -1053,8 +1182,9 @@ class Backtester:
             trade.exit_price = fill
             trade.gross_pnl = pnl
             trade.commission_paid += commission
+            trade.spread_cost += spread_cost
             trade.slippage_cost += slippage_cost_val
-            trade.pnl = pnl - commission - slippage_cost_val
+            trade.pnl = pnl - commission - spread_cost - slippage_cost_val
             total_costs = trade.commission_paid + trade.spread_cost + trade.slippage_cost
             trade.net_pnl = trade.gross_pnl - total_costs + trade.swap_pnl
             trade.notes["exit_stop"] = 1.0 if is_stop[i] else 0.0
@@ -1136,12 +1266,12 @@ class Backtester:
                 return None
             return float(numeric)
 
-        provider_spread = _float_or_none(row.get("spread")) if isinstance(row, pd.Series) else None
+        provider_spread = _float_or_none(row.get("spread")) if hasattr(row, "get") else None
         price = (
             _float_or_none(signal.price)
             or _float_or_none(signal.limit_price)
             or _float_or_none(signal.stop_price)
-            or _float_or_none(row.get("close") if isinstance(row, pd.Series) else None)
+            or _float_or_none(row.get("close") if hasattr(row, "get") else None)
             or 0.0
         )
         volume = abs(_float_or_none(signal.volume) or 1.0)
@@ -1180,14 +1310,16 @@ class Backtester:
         else:
             pnl = (trade.entry_price - fill_price) * pv * trade.volume
         commission = costs.commission_one_side(symbol, float(fill_price), trade.volume)
+        spread_cost = self._half_spread_cost(symbol, row, trade.volume)
         slippage_points = self._slippage_points(symbol, row)
         slippage_cost_val = costs.slippage_cost(symbol, slippage_points, trade.volume)
         trade.exit_time = ts
         trade.exit_price = float(fill_price)
         trade.gross_pnl = pnl
         trade.commission_paid += commission
+        trade.spread_cost += spread_cost
         trade.slippage_cost += slippage_cost_val
-        trade.pnl = pnl - commission - slippage_cost_val
+        trade.pnl = pnl - commission - spread_cost - slippage_cost_val
         total_costs = trade.commission_paid + trade.spread_cost + trade.slippage_cost
         trade.net_pnl = trade.gross_pnl - total_costs + trade.swap_pnl
         trade.notes[f"exit_{reason}"] = 1.0
@@ -1324,6 +1456,7 @@ class Backtester:
         entry_swap = trade.swap_pnl * entry_ratio
 
         close_commission = costs.commission_one_side(symbol, float(fill_price), target)
+        close_spread = self._half_spread_cost(symbol, row, target)
         slippage_points = self._slippage_points(symbol, row)
         close_slippage = costs.slippage_cost(symbol, slippage_points, target)
 
@@ -1336,7 +1469,7 @@ class Backtester:
             stop_points=trade.stop_points,
             take_points=trade.take_points,
             commission_paid=entry_commission + close_commission,
-            spread_cost=entry_spread,
+            spread_cost=entry_spread + close_spread,
             slippage_cost=entry_slippage + close_slippage,
             swap_pnl=entry_swap,
             order_id=trade.order_id,
@@ -1375,6 +1508,23 @@ class Backtester:
         if self.cfg.slippage_atr_multiplier > 0 and "atr" in row and not pd.isna(row["atr"]):
             base += float(row["atr"]) * self.cfg.slippage_atr_multiplier
         return base if base else 0.0
+
+    def _spread_points(self, row: pd.Series) -> float:
+        if not self.cfg.apply_spread_cost:
+            return 0.0
+        try:
+            spread_points = float(row.get("spread", 0.0))
+        except (TypeError, ValueError):
+            return 0.0
+        if pd.isna(spread_points):
+            return 0.0
+        return max(spread_points, 0.0)
+
+    def _half_spread_cost(self, symbol: str, row: pd.Series, volume: float) -> float:
+        spread_points = self._spread_points(row)
+        if spread_points <= 0.0:
+            return 0.0
+        return costs.spread_cost(symbol, spread_points, volume) / 2.0
 
     def _tick_size(self, symbol: str) -> float:
         inst = self.instruments.get(symbol)

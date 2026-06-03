@@ -165,6 +165,29 @@ def strategy_boolean_flag_field(
     )
 
 
+def strategy_choice_field(
+    *,
+    default: Any,
+    allowed_values: List[Any],
+    allowed_values_preset: str,
+    group: str = "default",
+    optimizable: bool = True,
+    description: str | None = None,
+    metadata: Dict[str, Any] | None = None,
+):
+    return field(
+        default=default,
+        metadata=_build_metadata(
+            group=group,
+            optimizable=optimizable,
+            allowed_values=list(allowed_values),
+            allowed_values_preset=allowed_values_preset,
+            description=description,
+            metadata=metadata,
+        ),
+    )
+
+
 __all__ = [
     "DEFAULT_STRATEGY_SESSION_TIMEZONE",
     "DEFAULT_STRATEGY_TIMEFRAME",
@@ -174,6 +197,7 @@ __all__ = [
     "list_supported_strategy_timeframes",
     "resolve_strategy_parameter_allowed_values_preset",
     "strategy_boolean_flag_field",
+    "strategy_choice_field",
     "strategy_session_timezone_field",
     "strategy_timeframe_field",
 ]

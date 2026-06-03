@@ -1,13 +1,37 @@
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
 import threading
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import pandas as pd
 
+from arbitrix_core.margin import (
+    MarginCallEvent,
+    MarginParams,
+    NoMargin,
+    get_margin_params,
+    resolve_margin_model,
+)
 from arbitrix_core.trading import Order, Trade
+
+
+def _margin_model_for_symbol(symbol: str):
+    """Resolve the per-symbol :class:`MarginModel`, falling back to
+    :class:`NoMargin` if the symbol isn't in the registry or its params
+    can't be resolved. Unknown symbol → zero margin contribution, so a
+    missing registry entry never crashes the equity loop.
+    """
+    try:
+        params = get_margin_params(symbol)
+    except KeyError:
+        return NoMargin()
+    try:
+        return resolve_margin_model(params)
+    except ValueError:
+        return NoMargin()
 
 
 def _normalize_ts(value: Optional[datetime | pd.Timestamp]) -> Optional[pd.Timestamp]:
@@ -56,6 +80,10 @@ class Portfolio:
         self._version = 0
         self._exposure_cache: Dict[Tuple[str, Optional[str], Optional[pd.Timestamp], int], Dict[str, Any]] = {}
         self._last_prices: Dict[str, float] = {}
+        # Portfolio-level margin cap, set by the engine at boot from
+        # :attr:`BTConfig.max_margin_utilization` (Sub-spec 2 / Task 20).
+        # Default 1.0 = no cap beyond per-symbol margin_available check.
+        self.max_margin_utilization: float = 1.0
 
     def _bump(self) -> None:
         self._version += 1
@@ -80,6 +108,120 @@ class Portfolio:
     @property
     def initial_equity(self) -> float:
         return self._initial_equity
+
+    def margin_used(self) -> float:
+        """Sum of per-symbol :meth:`MarginModel.initial` across open positions.
+
+        Aggregates :attr:`_open_trades` by symbol (sum of volume,
+        volume-weighted entry_price) and asks each symbol's MarginModel for
+        its initial-margin contribution. Unknown symbols (not in the margin
+        registry) fall back to :class:`NoMargin` → zero contribution, so a
+        missing registry entry never crashes the equity loop. See
+        Sub-spec 2 / Task 19 for the contract.
+        """
+        acc: Dict[str, List[float]] = defaultdict(lambda: [0.0, 0.0])  # [vol_sum, notional_sum]
+        with self._lock:
+            for trade in self._open_trades:
+                if trade.volume <= 0:
+                    continue  # paranoia: stale 0-volume trade post partial-close race
+                acc[trade.symbol][0] += float(trade.volume)
+                acc[trade.symbol][1] += float(trade.volume) * float(trade.entry_price)
+        total = 0.0
+        for symbol, (vol, notional) in acc.items():
+            if vol <= 0:
+                continue  # paranoia: stale 0-volume trade post partial-close race
+            avg_price = notional / vol
+            model = _margin_model_for_symbol(symbol)
+            money = model.initial(symbol, qty=vol, price=avg_price)
+            total += money.amount
+        return total
+
+    def margin_available(self) -> float:
+        """``equity - margin_used``. Negative result means over-leveraged.
+
+        Compared against :attr:`BTConfig.max_margin_utilization` by the
+        engine; portfolio-level cap is enforced in addition to the
+        per-symbol margin check (Sub-spec 2 / Task 19).
+        """
+        return self._equity - self.margin_used()
+
+    def can_open(self, symbol: str, qty: float, price: float) -> bool:
+        """Pre-submit gate. Returns True only if BOTH:
+
+        1. The new position's per-symbol initial margin
+           ``<= margin_available``.
+        2. ``(margin_used + new_margin) / equity <= max_margin_utilization``.
+
+        Either failure rejects the order. Unknown symbol falls back to
+        :class:`NoMargin` (zero margin contribution), so a missing
+        registry entry never blocks an order — that's a Sub-spec 1
+        hydration concern, not a margin check.
+
+        Edge case: if ``equity <= 0`` the ratio is undefined; we allow
+        only the trivial case where the projected used margin is also
+        zero (e.g. an unknown symbol). Any positive new margin is
+        rejected via check 1 since ``margin_available`` is non-positive.
+        """
+        model = _margin_model_for_symbol(symbol)
+        new_margin = model.initial(symbol, qty=qty, price=price).amount
+
+        # Check 1: per-symbol vs available cash margin.
+        if new_margin > self.margin_available():
+            return False
+
+        # Check 2: portfolio-level cap.
+        projected_used = self.margin_used() + new_margin
+        if self._equity <= 0:
+            return projected_used == 0.0
+        if projected_used / self._equity > self.max_margin_utilization:
+            return False
+
+        return True
+
+    def check_maintenance_margin(self, ts: pd.Timestamp) -> Iterator[MarginCallEvent]:
+        """Yield one MarginCallEvent per open symbol when the *total* per-symbol
+        maintenance requirement across the book exceeds current mark-to-market
+        equity (``_equity_marked``, kept in sync per-bar by the engine via
+        ``portfolio.sync(..., equity_marked=...)`` after stop/order processing).
+
+        Reading MTM equity rather than realized equity lets adverse price moves
+        on open positions trigger a margin call before the position is closed —
+        which is the actual real-world behaviour. ``_equity_marked`` defaults to
+        ``_equity`` at construction and stays equal to it whenever no
+        mark-to-market price is available, so unit tests that seed only the
+        portfolio's open trades (no ``update_market`` calls) still trigger
+        identically.
+
+        This function ONLY observes; it does NOT mutate state or place orders.
+        """
+        acc: Dict[str, List[float]] = defaultdict(lambda: [0.0, 0.0])  # [vol_sum, notional_sum]
+        with self._lock:
+            trades_snapshot = list(self._open_trades)
+        for trade in trades_snapshot:
+            if trade.volume <= 0:
+                continue  # paranoia: stale 0-volume trade post partial-close race
+            acc[trade.symbol][0] += float(trade.volume)
+            acc[trade.symbol][1] += float(trade.volume) * float(trade.entry_price)
+        per_symbol_maint: Dict[str, float] = {}
+        for symbol, (vol, notional) in acc.items():
+            if vol <= 0:
+                continue  # paranoia: stale 0-volume trade post partial-close race
+            avg_price = notional / vol
+            model = _margin_model_for_symbol(symbol)
+            money = model.maintenance(symbol, qty=vol, price=avg_price)
+            per_symbol_maint[symbol] = money.amount
+        total_maint = sum(per_symbol_maint.values())
+        if total_maint <= self._equity_marked:
+            return
+        for symbol, maint in per_symbol_maint.items():
+            if maint <= 0.0:  # NoMargin fallback yields 0 → skip unknowns
+                continue
+            yield MarginCallEvent(
+                symbol=symbol,
+                equity=self._equity_marked,
+                maintenance_required=total_maint,
+                ts=ts,
+            )
 
     @property
     def last_update(self) -> Optional[pd.Timestamp]:
@@ -735,8 +877,18 @@ class Portfolio:
         pending_orders = [order for order in self._pending_orders if order.symbol == symbol]
         open_volume = sum(trade.volume for trade in open_trades)
         closed_volume = sum(trade.volume for trade in closed_trades)
-        open_notional = sum(trade.entry_price * trade.volume for trade in open_trades)
-        closed_notional = sum(trade.entry_price * trade.volume for trade in closed_trades)
+        # ARB / Sub-spec 1: FUT notional = price × volume × multiplier. For
+        # non-FUT, multiplier == 1.0, so behavior is unchanged. See
+        # docs/symbols/futures.md for the rationale.
+        def _mult(sym: str) -> float:
+            try:
+                from arbitrix_core.symbols.context import get_symbol_context
+                return float(get_symbol_context(sym).multiplier)
+            except (KeyError, ImportError):
+                return 1.0
+        mult = _mult(symbol)
+        open_notional = sum(trade.entry_price * trade.volume * mult for trade in open_trades)
+        closed_notional = sum(trade.entry_price * trade.volume * mult for trade in closed_trades)
         pending_volume = sum(order.volume for order in pending_orders)
         return {
             "symbol": symbol,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import date
 from typing import Dict, Literal, Optional, Protocol
 from uuid import uuid4
 
@@ -107,6 +108,7 @@ class Trade:
     strategy: Optional[str] = None
     magic: Optional[int] = None
     _last_swap_day: Optional[pd.Timestamp] = None
+    expiry: Optional[date] = None
 
 
 @dataclass
@@ -118,6 +120,7 @@ class Position:
     volume: float
     avg_price: float
     trades: list[Trade] = field(default_factory=list)
+    expiry: Optional[date] = None
 
 
 class ExecutionContext(Protocol):
