@@ -34,6 +34,7 @@ __all__ = [
 
 _POINT_OVERRIDES: Dict[str, float] = {}
 _POINT_VALUE_CACHE: Dict[str, float] = {}
+_TICK_SIZE_CACHE: Dict[str, float] = {}
 _INSTRUMENTS: Dict[str, InstrumentConfig] = {}
 _SWAP_POINTS_CACHE: Dict[tuple[str, str], float] = {}
 _DATA_PROVIDER: DataProvider | None = None
@@ -57,14 +58,16 @@ def configure_environment(
     clear_provider: bool = False,
 ) -> None:
     """Configure shared cost infrastructure for the active model."""
-    global _DATA_PROVIDER, _COMMISSION_PER_LOT, _POINT_VALUE_CACHE, _POINT_OVERRIDES, _INSTRUMENTS, _ALLOW_PROVIDER_LOOKUPS
+    global _DATA_PROVIDER, _COMMISSION_PER_LOT, _POINT_VALUE_CACHE, _TICK_SIZE_CACHE, _POINT_OVERRIDES, _INSTRUMENTS, _ALLOW_PROVIDER_LOOKUPS
     if clear_provider:
         _DATA_PROVIDER = None
         _POINT_VALUE_CACHE = {}
+        _TICK_SIZE_CACHE = {}
         _SWAP_POINTS_CACHE.clear()
     elif provider is not None:
         _DATA_PROVIDER = provider
         _POINT_VALUE_CACHE = {}
+        _TICK_SIZE_CACHE = {}
         _SWAP_POINTS_CACHE.clear()
     if commission_per_lot is not None:
         set_commission_per_lot(commission_per_lot)
@@ -79,6 +82,7 @@ def configure_environment(
             normalized[str(symbol).lower()] = numeric
         _POINT_OVERRIDES = normalized
         _POINT_VALUE_CACHE = {}
+        _TICK_SIZE_CACHE = {}
     if instruments is not None:
         normalized_instruments: Dict[str, InstrumentConfig] = {}
         for symbol, inst in instruments.items():
@@ -86,6 +90,7 @@ def configure_environment(
             normalized_instruments[str(symbol).lower()] = inst
         _INSTRUMENTS = normalized_instruments
         _POINT_VALUE_CACHE = {}
+        _TICK_SIZE_CACHE = {}
     _ALLOW_PROVIDER_LOOKUPS = bool(allow_provider_lookups)
     try:
         logger.debug(
@@ -305,17 +310,28 @@ def trade_notional(symbol: str, price: float, volume_lot: float) -> float:
 
 
 def tick_size(symbol: str) -> float:
+    cache_key = str(symbol).lower()
+    with _LOCK:
+        cached = _TICK_SIZE_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
+    value = 1.0
     inst = get_instrument(symbol)
     if inst and inst.tick_size:
-        return float(inst.tick_size)
-    if _ALLOW_PROVIDER_LOOKUPS and _DATA_PROVIDER is not None:
+        value = float(inst.tick_size)
+    elif _ALLOW_PROVIDER_LOOKUPS and _DATA_PROVIDER is not None:
         info = _DATA_PROVIDER.get_symbol_info(symbol) or {}
         for key in ("point", "trade_tick_size", "tick_size"):
             candidate = _as_float(info.get(key))
             if candidate and candidate > 0:
-                return float(candidate)
+                value = float(candidate)
+                break
+
     # If no explicit tick size, fall back to 1 "point".
-    return 1.0
+    with _LOCK:
+        _TICK_SIZE_CACHE[cache_key] = value
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -567,6 +583,13 @@ def inject_point_value_cache(cache: Dict[str, float]) -> None:
         _POINT_VALUE_CACHE[key.lower()] = float(value)
 
 
+def inject_tick_size_cache(cache: Dict[str, float]) -> None:
+    """Inject pre-computed tick sizes into the cache for provider-free workers."""
+    global _TICK_SIZE_CACHE
+    for key, value in cache.items():
+        _TICK_SIZE_CACHE[key.lower()] = float(value)
+
+
 def inject_swap_cache(cache: Dict[tuple[str, str], float]) -> None:
     """
     Inject pre-computed swap points into the cache.
@@ -590,6 +613,7 @@ def export_caches() -> Dict[str, Any]:
     """
     return {
         "point_values": dict(_POINT_VALUE_CACHE),
+        "tick_sizes": dict(_TICK_SIZE_CACHE),
         "swap_points": dict(_SWAP_POINTS_CACHE),
     }
 
@@ -603,8 +627,10 @@ def import_caches(data: Dict[str, Any]) -> None:
         data: Dictionary from export_caches() containing cached values.
     """
     pv_cache = data.get("point_values") or {}
+    tick_cache = data.get("tick_sizes") or {}
     swap_cache = data.get("swap_points") or {}
     inject_point_value_cache(pv_cache)
+    inject_tick_size_cache(tick_cache)
     for key, value in swap_cache.items():
         if isinstance(key, (list, tuple)) and len(key) == 2:
             _SWAP_POINTS_CACHE[(str(key[0]).lower(), key[1])] = float(value)
