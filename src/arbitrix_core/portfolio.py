@@ -352,6 +352,59 @@ class Portfolio:
             self._open_trades.append(trade)
             self._bump()
 
+    def apply_open_trade_costs(
+        self,
+        trade_id: str,
+        *,
+        commission_paid: Optional[float] = None,
+        spread_cost: Optional[float] = None,
+        slippage_cost: Optional[float] = None,
+        swap_pnl: Optional[float] = None,
+        notes: Optional[Dict[str, float]] = None,
+    ) -> bool:
+        with self._lock:
+            trade = next((item for item in self._open_trades if item.id == trade_id), None)
+            if trade is None:
+                return False
+            previous_net = (
+                -float(getattr(trade, "commission_paid", 0.0) or 0.0)
+                - float(getattr(trade, "spread_cost", 0.0) or 0.0)
+                - float(getattr(trade, "slippage_cost", 0.0) or 0.0)
+                + float(getattr(trade, "swap_pnl", 0.0) or 0.0)
+            )
+            changed = False
+            if commission_paid is not None:
+                trade.commission_paid = float(commission_paid)
+                changed = True
+            if spread_cost is not None:
+                trade.spread_cost = float(spread_cost)
+                changed = True
+            if slippage_cost is not None:
+                trade.slippage_cost = float(slippage_cost)
+                changed = True
+            if swap_pnl is not None:
+                trade.swap_pnl = float(swap_pnl)
+                changed = True
+            if notes:
+                for key, value in notes.items():
+                    try:
+                        trade.notes[str(key)] = float(value)
+                    except Exception:
+                        continue
+                changed = True
+            if not changed:
+                return False
+            current_net = (
+                -float(getattr(trade, "commission_paid", 0.0) or 0.0)
+                - float(getattr(trade, "spread_cost", 0.0) or 0.0)
+                - float(getattr(trade, "slippage_cost", 0.0) or 0.0)
+                + float(getattr(trade, "swap_pnl", 0.0) or 0.0)
+            )
+            self._equity += current_net - previous_net
+            self._recalc_mark_to_market()
+            self._bump()
+            return True
+
     def get_trade_by_id(self, trade_id: str) -> Optional[Trade]:
         with self._lock:
             for trade in self._open_trades:
