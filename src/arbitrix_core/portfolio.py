@@ -437,6 +437,35 @@ class Portfolio:
                     return True
         return False
 
+    def fill_order_from_broker(
+        self,
+        order_id: str,
+        *,
+        fill_price: float,
+        fill_time: pd.Timestamp,
+        position_ticket: Optional[int] = None,
+    ) -> Optional[Trade]:
+        ts = _normalize_ts(fill_time)
+        if ts is None:
+            return None
+        with self._lock:
+            if any(trade.order_id == order_id for trade in self._open_trades):
+                return None
+            order = next((item for item in self._orders if item.id == order_id), None)
+            if order is None or order.status not in ("new", "working"):
+                return None
+            order.status = "filled"
+            self._pending_orders = [item for item in self._pending_orders if item.id != order_id]
+            trade = self._open_trade_from_order(order, fill_price=float(fill_price), fill_time=ts)
+            if trade is None:
+                self._bump()
+                return None
+            trade.broker_ticket = position_ticket if position_ticket is not None else order.broker_ticket
+            self._open_trades.append(trade)
+            self._recalc_mark_to_market()
+            self._bump()
+            return trade
+
     def update_trade_stops(
         self,
         trade_id: str,
@@ -1104,6 +1133,7 @@ class Portfolio:
         )
         closed_trade.exit_time = exit_time
         closed_trade.exit_price = float(exit_price)
+        closed_trade.notes.update(dict(getattr(trade, "notes", {}) or {}))
         closed_trade.notes[f"exit_{reason}"] = 1.0
         closed_trade.gross_pnl = self._calc_trade_pnl_volume(trade, float(exit_price), volume)
         total_costs = closed_trade.commission_paid + closed_trade.spread_cost + closed_trade.slippage_cost
