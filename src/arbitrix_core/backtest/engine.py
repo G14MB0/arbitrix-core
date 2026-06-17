@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import inspect
+import json
 import logging
 import math
+import os
 import re
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime, timezone
+from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
 import numpy as np
@@ -24,6 +27,105 @@ logger = logging.getLogger(__name__)
 
 
 _ON_BAR_DISPATCH_CACHE: Dict[type, tuple[bool, bool]] = {}
+
+
+def _audit_safe(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, (str, int, bool)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, pd.Timestamp):
+        if pd.isna(value):
+            return None
+        ts = value
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")
+        return ts.tz_convert("UTC").isoformat().replace("+00:00", "Z")
+    if isinstance(value, datetime):
+        ts = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+        return ts.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    if isinstance(value, date):
+        return value.isoformat()
+    if hasattr(value, "item"):
+        try:
+            return _audit_safe(value.item())
+        except Exception:
+            pass
+    if isinstance(value, dict):
+        return {str(k): _audit_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_audit_safe(v) for v in value]
+    return str(value)
+
+
+def _audit_safe_name(value: Any) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value or "unknown")).strip("._")
+    return safe or "unknown"
+
+
+def _audit_row_payload(row: Any) -> Dict[str, Any]:
+    keys = (
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "spread",
+        "local_hour",
+        "local_date",
+        "long_entry",
+        "short_entry",
+        "advanced_setup_allowed",
+        "advanced_setup_reason",
+        "advanced_filter_passed",
+        "advanced_filter_reason",
+        "atr14",
+        "atr60",
+        "atr_ratio",
+        "atr_ratio_q20",
+        "session_high_so_far",
+        "session_low_so_far",
+        "prev_high",
+        "prev_low",
+        "or_high",
+        "or_low",
+    )
+    if not hasattr(row, "get"):
+        return {}
+    return {key: row.get(key) for key in keys if key in row}
+
+
+def _audit_signal_payload(sig: Signal) -> Dict[str, Any]:
+    return {
+        "action": getattr(sig, "action", None),
+        "when": getattr(sig, "when", None),
+        "price": getattr(sig, "price", None),
+        "quantity": getattr(sig, "quantity", None),
+        "reason": getattr(sig, "reason", None),
+        "order_type": getattr(sig, "order_type", None),
+        "target_trade_id": getattr(sig, "target_trade_id", None),
+        "target_order_id": getattr(sig, "target_order_id", None),
+        "magic": getattr(sig, "magic", None),
+    }
+
+
+def _backtest_audit_writer(strategy_key: str) -> Optional[Callable[[Dict[str, Any]], None]]:
+    enabled = str(os.getenv("ARBITRIX_BACKTEST_AUDIT_ENABLED", "")).strip().lower()
+    if enabled not in {"1", "true", "yes", "on"}:
+        return None
+    run_id = _audit_safe_name(os.getenv("ARBITRIX_BACKTEST_AUDIT_RUN_ID", "backtest"))
+    root = Path(os.getenv("ARBITRIX_BACKTEST_AUDIT_ROOT", "runtime/storage/backtest_audit"))
+    path = root / run_id / f"{_audit_safe_name(strategy_key)}.jsonl"
+
+    def write(payload: Dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(_audit_safe(payload), ensure_ascii=False, separators=(",", ":")) + "\n"
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(line)
+
+    return write
 
 
 def _on_bar_dispatch_capabilities(strategy) -> Optional[tuple[bool, bool]]:
@@ -257,6 +359,12 @@ class Backtester:
 
         # Log input data range for standard backtest
         strategy_name = getattr(strategy, 'name', '') or strategy.__class__.__name__
+        audit_write = _backtest_audit_writer(strategy_name)
+        warmup_bars = int(getattr(strategy, "warmup_bars", lambda: 0)() or 0)
+        strict_prepare_window = str(
+            os.getenv("ARBITRIX_BACKTEST_STRICT_PREPARE_WINDOW", "") or ""
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        rolling_prepare = warmup_bars > 1 and strict_prepare_window
         df_start = df.index[0].isoformat() if not df.empty else 'N/A'
         df_end = df.index[-1].isoformat() if not df.empty else 'N/A'
         if collect_diagnostics:
@@ -266,24 +374,28 @@ class Backtester:
             )
 
         prepare_started = time.monotonic()
-        section_started = time.monotonic() if runtime_breakdown_enabled else 0.0
-        prepared = strategy.prepare(df)
-        if runtime_breakdown_enabled:
-            prepare_breakdown["strategy_prepare_s"] += max(
-                0.0,
-                time.monotonic() - section_started,
-            )
-        _maybe_cancel()
+        if rolling_prepare:
+            prepared = df.copy()
+        else:
+            section_started = time.monotonic() if runtime_breakdown_enabled else 0.0
+            prepared = strategy.prepare(df)
+            if runtime_breakdown_enabled:
+                prepare_breakdown["strategy_prepare_s"] += max(
+                    0.0,
+                    time.monotonic() - section_started,
+                )
+            _maybe_cancel()
 
         if prepared is None or not isinstance(prepared, pd.DataFrame):
             raise ValueError("Strategy.prepare() must return a DataFrame.")
-        section_started = time.monotonic() if runtime_breakdown_enabled else 0.0
-        prepared = self._preserve_prepared_columns(df, prepared, columns=("spread", "__regime_output__"))
-        if runtime_breakdown_enabled:
-            prepare_breakdown["preserve_columns_s"] += max(
-                0.0,
-                time.monotonic() - section_started,
-            )
+        if not rolling_prepare:
+            section_started = time.monotonic() if runtime_breakdown_enabled else 0.0
+            prepared = self._preserve_prepared_columns(df, prepared, columns=("spread", "__regime_output__"))
+            if runtime_breakdown_enabled:
+                prepare_breakdown["preserve_columns_s"] += max(
+                    0.0,
+                    time.monotonic() - section_started,
+                )
 
         if prepared.empty:
             strategy_name = getattr(strategy, 'name', '') or strategy.__class__.__name__
@@ -295,8 +407,7 @@ class Backtester:
                 f"Input had {len(df)} bars. Check logs for strategy-specific requirements."
             )
 
-        warmup_bars = int(getattr(strategy, "warmup_bars", lambda: 0)() or 0)
-        if warmup_bars > 0 and start_filter is None:
+        if warmup_bars > 0 and start_filter is None and not rolling_prepare:
             section_started = time.monotonic() if runtime_breakdown_enabled else 0.0
             if len(prepared) < warmup_bars:
                 strategy_name = getattr(strategy, 'name', '') or strategy.__class__.__name__
@@ -329,7 +440,7 @@ class Backtester:
                 f"[STANDARD] {strategy_name} - Prepared data range: {prep_start} to {prep_end} ({len(prepared)} bars)"
             )
 
-        if start_filter is not None and not prepared.empty:
+        if start_filter is not None and not prepared.empty and not rolling_prepare:
             section_started = time.monotonic() if runtime_breakdown_enabled else 0.0
             index = prepared.index
             if not isinstance(index, pd.DatetimeIndex):
@@ -356,8 +467,31 @@ class Backtester:
                     0.0,
                     time.monotonic() - section_started,
                 )
+        if audit_write is not None:
+            try:
+                audit_write(
+                    {
+                        "event": "backtest_prepare",
+                        "wall_ts": datetime.now(timezone.utc),
+                        "strategy": strategy.__class__.__name__,
+                        "strategy_name": strategy_name,
+                        "symbol": getattr(strategy, "symbol", None),
+                        "timeframe": getattr(strategy, "timeframe", None),
+                        "source_rows": int(len(df)),
+                        "source_first_ts": df.index[0] if not df.empty else None,
+                        "source_last_ts": df.index[-1] if not df.empty else None,
+                        "prepared_rows": int(len(prepared)),
+                        "prepared_first_ts": prepared.index[0] if not prepared.empty else None,
+                        "prepared_last_ts": prepared.index[-1] if not prepared.empty else None,
+                        "start_filter": start_filter,
+                        "warmup_bars": warmup_bars,
+                        "prepare_window_mode": "warmup" if rolling_prepare else "vectorized",
+                    }
+                )
+            except Exception:
+                logger.debug("Failed to write backtest prepare audit for %s", strategy_name, exc_info=True)
         prepare_elapsed = max(0.0, time.monotonic() - prepare_started)
-        prepared_snapshot = prepared.copy() if capture_prepared else None
+        prepared_snapshot = None if rolling_prepare else (prepared.copy() if capture_prepared else None)
 
         equity = float(initial_equity)
         gross_equity = float(initial_equity)
@@ -400,13 +534,29 @@ class Backtester:
         )
         running_peak_equity = float(initial_equity)
         running_max_drawdown = 0.0
-        prepared_index = prepared.index
-        if not isinstance(prepared_index, pd.DatetimeIndex):
+        if not isinstance(prepared.index, pd.DatetimeIndex):
             raise ValueError("Strategy output must use a datetime index.")
-        if prepared_index.tz is None:
-            loop_index = prepared_index.tz_localize("UTC")
+        if rolling_prepare:
+            source_index = prepared.index.tz_localize("UTC") if prepared.index.tz is None else prepared.index.tz_convert("UTC")
+            eval_positions: List[int] = []
+            for position, ts_candidate in enumerate(source_index):
+                if position + 1 < warmup_bars:
+                    continue
+                if start_filter is not None and pd.Timestamp(ts_candidate) < start_filter:
+                    continue
+                eval_positions.append(position)
+            if not eval_positions:
+                raise ValueError(
+                    f"No data available with warmup_bars={warmup_bars} "
+                    f"for strategy {getattr(strategy, 'name', '') or 'unknown'}."
+                )
+            loop_index = pd.DatetimeIndex([source_index[position] for position in eval_positions])
         else:
-            loop_index = prepared_index.tz_convert("UTC")
+            prepared_index = prepared.index
+            if prepared_index.tz is None:
+                loop_index = prepared_index.tz_localize("UTC")
+            else:
+                loop_index = prepared_index.tz_convert("UTC")
         loop_days = loop_index.normalize()
         cancel_check_interval = 1 if collect_diagnostics else 64
         bar_count = 0
@@ -414,19 +564,50 @@ class Backtester:
         early_stop_reason = None
 
         loop_started = time.monotonic()
-        prepared_len = len(prepared)
+        prepared_len = len(eval_positions) if rolling_prepare else len(prepared)
         row_mode = str(getattr(self.cfg, "row_mode", "series") or "series").strip().lower()
         if row_mode not in {"series", "bar_view"}:
             raise ValueError("BTConfig.row_mode must be 'series' or 'bar_view'.")
         prepared_iloc = prepared.iloc
-        bar_view_source = BarViewSource(prepared) if row_mode == "bar_view" else None
+        bar_view_source = BarViewSource(prepared) if row_mode == "bar_view" and not rolling_prepare else None
+        prepared_snapshot_rows: List[pd.Series] = []
+        last_loop_row: Optional[pd.Series] = None
         unrealized_pnl_fn = self._unrealized_pnl
         for row_idx in range(prepared_len):
-            row = (
-                bar_view_source.row_at(row_idx)
-                if bar_view_source is not None
-                else prepared_iloc[row_idx]
-            )
+            current_prepared = prepared
+            if rolling_prepare:
+                source_position = eval_positions[row_idx]
+                window = df.iloc[source_position - warmup_bars + 1 : source_position + 1]
+                section_started = time.monotonic() if runtime_breakdown_enabled else 0.0
+                current_prepared = strategy.prepare(window)
+                if runtime_breakdown_enabled:
+                    prepare_breakdown["strategy_prepare_s"] += max(
+                        0.0,
+                        time.monotonic() - section_started,
+                    )
+                if current_prepared is None or not isinstance(current_prepared, pd.DataFrame) or current_prepared.empty:
+                    raise ValueError("Strategy.prepare() must return a non-empty DataFrame.")
+                section_started = time.monotonic() if runtime_breakdown_enabled else 0.0
+                current_prepared = self._preserve_prepared_columns(
+                    window,
+                    current_prepared,
+                    columns=("spread", "__regime_output__"),
+                )
+                if runtime_breakdown_enabled:
+                    prepare_breakdown["preserve_columns_s"] += max(
+                        0.0,
+                        time.monotonic() - section_started,
+                    )
+                row = current_prepared.iloc[-1]
+                if capture_prepared:
+                    prepared_snapshot_rows.append(row.copy())
+            else:
+                row = (
+                    bar_view_source.row_at(row_idx)
+                    if bar_view_source is not None
+                    else prepared_iloc[row_idx]
+                )
+            last_loop_row = row
             control_started = time.monotonic() if runtime_breakdown_enabled else 0.0
             if row_idx % cancel_check_interval == 0:
                 _maybe_cancel()
@@ -482,6 +663,28 @@ class Backtester:
             if hasattr(row, "get"):
                 regime_output = row.get("__regime_output__")
             bar_signals = _invoke_strategy_on_bar(strategy, row, portfolio, regime_output)
+            if audit_write is not None:
+                try:
+                    audit_write(
+                        {
+                            "event": "bar_decision",
+                            "wall_ts": datetime.now(timezone.utc),
+                            "run_phase": "backtest",
+                            "strategy": strategy.__class__.__name__,
+                            "strategy_name": strategy_name,
+                            "symbol": symbol,
+                            "timeframe": getattr(strategy, "timeframe", None),
+                            "bar_ts": ts,
+                            "prepared_rows": int(len(current_prepared)),
+                            "prepared_first_ts": current_prepared.index[0] if not current_prepared.empty else None,
+                            "prepared_last_ts": current_prepared.index[-1] if not current_prepared.empty else None,
+                            "signals_count": len(bar_signals) if bar_signals else 0,
+                            "signals": [_audit_signal_payload(sig) for sig in bar_signals] if bar_signals else [],
+                            "row": _audit_row_payload(row),
+                        }
+                    )
+                except Exception:
+                    logger.debug("Failed to write backtest bar audit for %s", strategy_name, exc_info=True)
             if runtime_breakdown_enabled:
                 loop_breakdown["on_bar_s"] += max(0.0, time.monotonic() - section_started)
             section_started = time.monotonic() if runtime_breakdown_enabled else 0.0
@@ -588,7 +791,7 @@ class Backtester:
                         early_stop_reason = f"max_drawdown exceeded: {abs(current_dd):.4f} > {max_dd_threshold}"
                         break
 
-                if min_trades_threshold is not None and bar_count > len(prepared) * 0.3:
+                if min_trades_threshold is not None and bar_count > prepared_len * 0.3:
                     if len(closed_trades) < min_trades_threshold:
                         early_stopped = True
                         early_stop_reason = f"insufficient trades: {len(closed_trades)} < {min_trades_threshold}"
@@ -597,8 +800,16 @@ class Backtester:
                 loop_breakdown["early_stop_check_s"] += max(0.0, time.monotonic() - section_started)
         loop_elapsed = max(0.0, time.monotonic() - loop_started)
 
-        last_ts = prepared.index[-1].tz_localize("UTC") if prepared.index[-1].tzinfo is None else prepared.index[-1].tz_convert("UTC")
-        last_row = prepared.iloc[-1]
+        if rolling_prepare:
+            last_ts = pd.Timestamp(loop_index[min(bar_count, prepared_len) - 1])
+            last_row = last_loop_row
+            if last_row is None:
+                raise ValueError("No rows were processed by rolling prepare backtest.")
+            if capture_prepared:
+                prepared_snapshot = pd.DataFrame(prepared_snapshot_rows)
+        else:
+            last_ts = prepared.index[-1].tz_localize("UTC") if prepared.index[-1].tzinfo is None else prepared.index[-1].tz_convert("UTC")
+            last_row = prepared.iloc[-1]
         day = last_ts.normalize()
         section_started = time.monotonic() if runtime_breakdown_enabled else 0.0
         if early_stopped:
