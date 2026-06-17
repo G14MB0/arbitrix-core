@@ -1074,6 +1074,12 @@ class Portfolio:
             strategy=order.strategy,
             magic=order.magic,
         )
+        parent_id = str(getattr(order, "parent_id", "") or "")
+        if parent_id.startswith("startup_hydration:"):
+            owner = parent_id.split(":", 1)[1]
+            trade.notes["startup_hydration_synthetic"] = 1.0
+            if owner:
+                trade.notes[f"startup_hydration_owner:{owner}"] = 1.0
         return trade
 
     def _calc_trade_pnl(self, trade: Trade, exit_price: float) -> float:
