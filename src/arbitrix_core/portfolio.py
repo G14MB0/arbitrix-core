@@ -347,10 +347,75 @@ class Portfolio:
                 self._bump()
         return updated
 
+    def expire_order_by_id(self, order_id: str) -> bool:
+        updated = False
+        with self._lock:
+            for order in self._orders:
+                if order.id == order_id:
+                    order.status = "expired"
+                    updated = True
+            if updated:
+                self._pending_orders = [order for order in self._pending_orders if order.id != order_id]
+                self._bump()
+        return updated
+
     def add_trade(self, trade: Trade) -> None:
         with self._lock:
             self._open_trades.append(trade)
             self._bump()
+
+    def apply_open_trade_costs(
+        self,
+        trade_id: str,
+        *,
+        commission_paid: Optional[float] = None,
+        spread_cost: Optional[float] = None,
+        slippage_cost: Optional[float] = None,
+        swap_pnl: Optional[float] = None,
+        notes: Optional[Dict[str, float]] = None,
+    ) -> bool:
+        with self._lock:
+            trade = next((item for item in self._open_trades if item.id == trade_id), None)
+            if trade is None:
+                return False
+            previous_net = (
+                -float(getattr(trade, "commission_paid", 0.0) or 0.0)
+                - float(getattr(trade, "spread_cost", 0.0) or 0.0)
+                - float(getattr(trade, "slippage_cost", 0.0) or 0.0)
+                + float(getattr(trade, "swap_pnl", 0.0) or 0.0)
+            )
+            changed = False
+            if commission_paid is not None:
+                trade.commission_paid = float(commission_paid)
+                changed = True
+            if spread_cost is not None:
+                trade.spread_cost = float(spread_cost)
+                changed = True
+            if slippage_cost is not None:
+                trade.slippage_cost = float(slippage_cost)
+                changed = True
+            if swap_pnl is not None:
+                trade.swap_pnl = float(swap_pnl)
+                changed = True
+            if notes:
+                for key, value in notes.items():
+                    try:
+                        trade.notes[str(key)] = float(value)
+                    except Exception:
+                        continue
+                changed = True
+            if not changed:
+                return False
+            current_net = (
+                -float(getattr(trade, "commission_paid", 0.0) or 0.0)
+                - float(getattr(trade, "spread_cost", 0.0) or 0.0)
+                - float(getattr(trade, "slippage_cost", 0.0) or 0.0)
+                + float(getattr(trade, "swap_pnl", 0.0) or 0.0)
+            )
+            self._equity += current_net - previous_net
+            self._recalc_mark_to_market()
+            self._bump()
+            return True
 
     def get_trade_by_id(self, trade_id: str) -> Optional[Trade]:
         with self._lock:
@@ -383,6 +448,35 @@ class Portfolio:
                     self._bump()
                     return True
         return False
+
+    def fill_order_from_broker(
+        self,
+        order_id: str,
+        *,
+        fill_price: float,
+        fill_time: pd.Timestamp,
+        position_ticket: Optional[int] = None,
+    ) -> Optional[Trade]:
+        ts = _normalize_ts(fill_time)
+        if ts is None:
+            return None
+        with self._lock:
+            if any(trade.order_id == order_id for trade in self._open_trades):
+                return None
+            order = next((item for item in self._orders if item.id == order_id), None)
+            if order is None or order.status not in ("new", "working"):
+                return None
+            order.status = "filled"
+            self._pending_orders = [item for item in self._pending_orders if item.id != order_id]
+            trade = self._open_trade_from_order(order, fill_price=float(fill_price), fill_time=ts)
+            if trade is None:
+                self._bump()
+                return None
+            trade.broker_ticket = position_ticket if position_ticket is not None else order.broker_ticket
+            self._open_trades.append(trade)
+            self._recalc_mark_to_market()
+            self._bump()
+            return trade
 
     def update_trade_stops(
         self,
@@ -753,6 +847,11 @@ class Portfolio:
                     order.status = "expired"
                     updated = True
                     continue
+                created_at = _normalize_ts(order.created_at)
+                if order.type != "market" and created_at is not None and created_at >= ts:
+                    order.status = "working"
+                    still_pending.append(order)
+                    continue
                 price = order.price if order.price is not None else close
                 filled = False
                 fill_price = price
@@ -992,6 +1091,12 @@ class Portfolio:
             strategy=order.strategy,
             magic=order.magic,
         )
+        parent_id = str(getattr(order, "parent_id", "") or "")
+        if parent_id.startswith("startup_hydration:"):
+            owner = parent_id.split(":", 1)[1]
+            trade.notes["startup_hydration_synthetic"] = 1.0
+            if owner:
+                trade.notes[f"startup_hydration_owner:{owner}"] = 1.0
         return trade
 
     def _calc_trade_pnl(self, trade: Trade, exit_price: float) -> float:
@@ -1051,6 +1156,7 @@ class Portfolio:
         )
         closed_trade.exit_time = exit_time
         closed_trade.exit_price = float(exit_price)
+        closed_trade.notes.update(dict(getattr(trade, "notes", {}) or {}))
         closed_trade.notes[f"exit_{reason}"] = 1.0
         closed_trade.gross_pnl = self._calc_trade_pnl_volume(trade, float(exit_price), volume)
         total_costs = closed_trade.commission_paid + closed_trade.spread_cost + closed_trade.slippage_cost
