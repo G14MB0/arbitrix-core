@@ -72,7 +72,7 @@ Signal(when=row.name, action="sell", price=float(row["close"]))
 |-------|------|----------|-------|
 | `when` | `pd.Timestamp` | yes | Always pass `row.name` |
 | `action` | `Literal` | yes | `"buy"`, `"sell"`, `"exit"`, `"close"`, `"partial_close"`, `"modify_sl"`, `"modify_tp"`, `"cancel_order"` |
-| `price` | `float` | yes | Reference price; the engine may fill at open or close per `BTConfig.market_fill_price` |
+| `price` | `float` | yes | Reference price; market fills use close or next bar open per `BTConfig.market_fill_price` |
 | `volume` | `float` | no | If `None`, engine sizes from `risk_perc + initial_equity + stop_distance_points` |
 | `order_type` | `Literal` | no | `"market"` (default), `"limit"`, `"stop"` |
 | `limit_price` / `stop_price` | `float` | no | Required when `order_type` ≠ `"market"` |

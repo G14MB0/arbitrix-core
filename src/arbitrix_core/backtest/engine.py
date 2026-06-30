@@ -201,7 +201,7 @@ class BTConfig:
     apply_spread_cost: bool = True
     apply_swap_cost: bool = True
     apply_stop_take: bool = True
-    market_fill_price: str = "close"  # "open" or "close"
+    market_fill_price: str = "close"  # "close" or "next_open"; "open" is normalized to "next_open"
     exit_fill_price: str = "close"  # "open" or "close"
     intra_bar_model: str = "sl_first"  # "sl_first", "tp_first", "none"
     trailing_mode: str = "none"  # placeholder for future engine modes
@@ -229,6 +229,8 @@ class BTResult:
 class Backtester:
     def __init__(self, cfg: BTConfig, instruments: Optional[Dict[str, InstrumentConfig]] = None):
         self.cfg = cfg
+        self.cfg.market_fill_price = self._normalize_market_fill_price(cfg.market_fill_price)
+        self.cfg.exit_fill_price = self._normalize_exit_fill_price(cfg.exit_fill_price)
         self.instruments = instruments or {}
         self._order_id = 0
         costs.set_commission_per_lot(cfg.commission_per_lot)
@@ -236,6 +238,22 @@ class Backtester:
     def _next_order_id(self) -> int:
         self._order_id += 1
         return self._order_id
+
+    @staticmethod
+    def _normalize_market_fill_price(value: Any) -> str:
+        mode = str(value or "").strip().lower()
+        if mode == "open":
+            return "next_open"
+        if mode in {"close", "next_open"}:
+            return mode
+        raise ValueError("BTConfig.market_fill_price must be 'close', 'next_open', or 'open'.")
+
+    @staticmethod
+    def _normalize_exit_fill_price(value: Any) -> str:
+        mode = str(value or "").strip().lower()
+        if mode in {"close", "open"}:
+            return mode
+        raise ValueError("BTConfig.exit_fill_price must be 'close' or 'open'.")
 
     @staticmethod
     def _preserve_prepared_columns(
@@ -617,6 +635,22 @@ class Backtester:
             if runtime_breakdown_enabled:
                 loop_breakdown["control_s"] += max(0.0, time.monotonic() - control_started)
 
+            working_orders = self._expire_orders_before_bar(working_orders, ts)
+            (
+                equity,
+                open_trades,
+                working_orders,
+                newly_filled_at_open,
+                newly_filled_orders_at_open,
+            ) = self._fill_ready_market_orders_at_bar_open(
+                symbol=symbol,
+                row=row,
+                ts=ts,
+                open_trades=open_trades,
+                working_orders=working_orders,
+                equity=equity,
+            )
+
             # Apply swap logic before evaluating stops/signals.
             section_started = time.monotonic() if runtime_breakdown_enabled else 0.0
             pre_sl_trades: List[Trade] = []
@@ -708,13 +742,7 @@ class Backtester:
 
             # Drop expired orders
             section_started = time.monotonic() if runtime_breakdown_enabled else 0.0
-            still_working: List[Order] = []
-            for order in working_orders:
-                if order.valid_until is not None and ts > order.valid_until:
-                    order.status = "expired"
-                    continue
-                still_working.append(order)
-            working_orders = still_working
+            working_orders = self._expire_orders_before_bar(working_orders, ts)
             if runtime_breakdown_enabled:
                 loop_breakdown["expire_orders_s"] += max(0.0, time.monotonic() - section_started)
 
@@ -728,12 +756,12 @@ class Backtester:
             newly_filled_orders: List[Order] = []
             remaining_orders: List[Order] = []
             for order in working_orders:
-                created_at = pd.Timestamp(order.created_at) if order.created_at is not None else None
-                if created_at is not None and created_at.tzinfo is None:
-                    created_at = created_at.tz_localize("UTC")
-                elif created_at is not None:
-                    created_at = created_at.tz_convert("UTC")
-                if order.type != "market" and created_at is not None and created_at > ts:
+                created_at = self._order_created_at(order)
+                if (
+                    (order.type != "market" or self.cfg.market_fill_price == "next_open")
+                    and created_at is not None
+                    and created_at > ts
+                ):
                     order.status = "working"
                     remaining_orders.append(order)
                     continue
@@ -741,12 +769,18 @@ class Backtester:
                 if filled is None:
                     remaining_orders.append(order)
                     continue
-                fill_time = created_at if order.type == "market" and created_at is not None else ts
+                if order.type == "market" and created_at is not None:
+                    if self.cfg.market_fill_price == "close":
+                        fill_time = created_at
+                    else:
+                        fill_time = created_at if created_at == ts else ts
+                else:
+                    fill_time = ts
                 trade, equity = self._open_trade_from_order(symbol, order, filled, row, fill_time, equity)
                 if trade:
                     newly_filled.append(trade)
                     newly_filled_orders.append(order)
-            working_orders = remaining_orders
+            working_orders = self._expire_orders_after_bar(remaining_orders, ts)
             open_trades.extend(newly_filled)
             if runtime_breakdown_enabled:
                 loop_breakdown["fill_orders_s"] += max(0.0, time.monotonic() - section_started)
@@ -782,13 +816,13 @@ class Backtester:
                         "equity": float(equity),
                         "gross_equity": float(gross_equity),
                         "bar_signals": list(bar_signals) if bar_signals else [],
-                        "newly_filled": list(newly_filled),
+                        "newly_filled": list(newly_filled_at_open) + list(newly_filled),
                         # ARB-129 iter-5: parallel to newly_filled, exposes the
                         # source Order for each filled Trade so observers can
                         # read Order.type / Order.price. Backwards-compatible:
                         # existing observers that ignore unknown keys are
                         # unaffected.
-                        "newly_filled_orders": list(newly_filled_orders),
+                        "newly_filled_orders": list(newly_filled_orders_at_open) + list(newly_filled_orders),
                     }
                 )
 
@@ -821,6 +855,11 @@ class Backtester:
             last_ts = prepared.index[-1].tz_localize("UTC") if prepared.index[-1].tzinfo is None else prepared.index[-1].tz_convert("UTC")
             last_row = prepared.iloc[-1]
         day = last_ts.normalize()
+        working_orders = self._expire_orders_after_bar(
+            working_orders,
+            last_ts,
+            expire_unfilled_market=True,
+        )
         section_started = time.monotonic() if runtime_breakdown_enabled else 0.0
         if early_stopped:
             for trade in open_trades:
@@ -1104,6 +1143,100 @@ class Backtester:
             margin_call_events=margin_call_events,
         )
 
+    @staticmethod
+    def _order_created_at(order: Order) -> Optional[pd.Timestamp]:
+        if order.created_at is None:
+            return None
+        created_at = pd.Timestamp(order.created_at)
+        if created_at.tzinfo is None:
+            return created_at.tz_localize("UTC")
+        return created_at.tz_convert("UTC")
+
+    @staticmethod
+    def _order_valid_until(order: Order) -> Optional[pd.Timestamp]:
+        if order.valid_until is None:
+            return None
+        valid_until = pd.Timestamp(order.valid_until)
+        if valid_until.tzinfo is None:
+            return valid_until.tz_localize("UTC")
+        return valid_until.tz_convert("UTC")
+
+    def _expire_orders_before_bar(self, orders: List[Order], ts: pd.Timestamp) -> List[Order]:
+        current_ts = self._normalize_ts(ts)
+        if current_ts is None:
+            return orders
+        still_working: List[Order] = []
+        for order in orders:
+            valid_until = self._order_valid_until(order)
+            if valid_until is not None and current_ts > valid_until:
+                order.status = "expired"
+                continue
+            still_working.append(order)
+        return still_working
+
+    def _expire_orders_after_bar(
+        self,
+        orders: List[Order],
+        ts: pd.Timestamp,
+        *,
+        expire_unfilled_market: bool = False,
+    ) -> List[Order]:
+        current_ts = self._normalize_ts(ts)
+        if current_ts is None:
+            return orders
+        still_working: List[Order] = []
+        for order in orders:
+            valid_until = self._order_valid_until(order)
+            if valid_until is not None and current_ts >= valid_until:
+                order.status = "expired"
+                continue
+            if expire_unfilled_market and order.type == "market":
+                order.status = "expired"
+                continue
+            still_working.append(order)
+        return still_working
+
+    def _fill_ready_market_orders_at_bar_open(
+        self,
+        *,
+        symbol: str,
+        row: pd.Series,
+        ts: pd.Timestamp,
+        open_trades: List[Trade],
+        working_orders: List[Order],
+        equity: float,
+    ) -> tuple[float, List[Trade], List[Order], List[Trade], List[Order]]:
+        if self.cfg.market_fill_price != "next_open" or not working_orders:
+            return equity, open_trades, working_orders, [], []
+
+        current_ts = self._normalize_ts(ts)
+        if current_ts is None:
+            return equity, open_trades, working_orders, [], []
+
+        remaining_orders: List[Order] = []
+        newly_filled: List[Trade] = []
+        newly_filled_orders: List[Order] = []
+        for order in working_orders:
+            if order.type != "market":
+                remaining_orders.append(order)
+                continue
+            created_at = self._order_created_at(order)
+            if created_at is not None and created_at > current_ts:
+                order.status = "working"
+                remaining_orders.append(order)
+                continue
+            filled = self._try_fill_order(order, row)
+            if filled is None:
+                remaining_orders.append(order)
+                continue
+            fill_time = created_at if created_at is not None and created_at == current_ts else current_ts
+            trade, equity = self._open_trade_from_order(symbol, order, filled, row, fill_time, equity)
+            if trade:
+                open_trades.append(trade)
+                newly_filled.append(trade)
+                newly_filled_orders.append(order)
+        return equity, open_trades, remaining_orders, newly_filled, newly_filled_orders
+
     def _unrealized_pnl(self, symbol: str, trades: List[Trade], row: pd.Series) -> float:
         if not trades:
             return 0.0
@@ -1197,7 +1330,7 @@ class Backtester:
 
     def _try_fill_order(self, order: Order, row: pd.Series) -> Optional[float]:
         if order.type == "market":
-            fill = row["open"] if self.cfg.market_fill_price == "open" else row["close"]
+            fill = row["open"] if self.cfg.market_fill_price == "next_open" else row["close"]
             order.status = "filled"
             return float(fill)
 
