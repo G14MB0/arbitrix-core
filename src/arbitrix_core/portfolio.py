@@ -347,6 +347,18 @@ class Portfolio:
                 self._bump()
         return updated
 
+    def expire_order_by_id(self, order_id: str) -> bool:
+        updated = False
+        with self._lock:
+            for order in self._orders:
+                if order.id == order_id:
+                    order.status = "expired"
+                    updated = True
+            if updated:
+                self._pending_orders = [order for order in self._pending_orders if order.id != order_id]
+                self._bump()
+        return updated
+
     def add_trade(self, trade: Trade) -> None:
         with self._lock:
             self._open_trades.append(trade)
@@ -834,6 +846,11 @@ class Portfolio:
                 if order.valid_until is not None and ts > order.valid_until:
                     order.status = "expired"
                     updated = True
+                    continue
+                created_at = _normalize_ts(order.created_at)
+                if order.type != "market" and created_at is not None and created_at >= ts:
+                    order.status = "working"
+                    still_pending.append(order)
                     continue
                 price = order.price if order.price is not None else close
                 filled = False

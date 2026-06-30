@@ -728,11 +728,21 @@ class Backtester:
             newly_filled_orders: List[Order] = []
             remaining_orders: List[Order] = []
             for order in working_orders:
+                created_at = pd.Timestamp(order.created_at) if order.created_at is not None else None
+                if created_at is not None and created_at.tzinfo is None:
+                    created_at = created_at.tz_localize("UTC")
+                elif created_at is not None:
+                    created_at = created_at.tz_convert("UTC")
+                if order.type != "market" and created_at is not None and created_at > ts:
+                    order.status = "working"
+                    remaining_orders.append(order)
+                    continue
                 filled = self._try_fill_order(order, row)
                 if filled is None:
                     remaining_orders.append(order)
                     continue
-                trade, equity = self._open_trade_from_order(symbol, order, filled, row, equity)
+                fill_time = created_at if order.type == "market" and created_at is not None else ts
+                trade, equity = self._open_trade_from_order(symbol, order, filled, row, fill_time, equity)
                 if trade:
                     newly_filled.append(trade)
                     newly_filled_orders.append(order)
@@ -1218,6 +1228,7 @@ class Backtester:
         order: Order,
         fill_price: float,
         row: pd.Series,
+        fill_time: pd.Timestamp,
         equity: float,
     ) -> tuple[Optional[Trade], float]:
         commission = costs.commission_one_side(symbol, float(fill_price), order.volume)
@@ -1229,7 +1240,7 @@ class Backtester:
         trade = Trade(
             symbol=symbol,
             side="long" if order.side == "buy" else "short",
-            entry_time=order.created_at,
+            entry_time=fill_time,
             entry_price=float(fill_price),
             volume=float(order.volume),
             stop_points=float(order.stop_points),
@@ -1241,7 +1252,7 @@ class Backtester:
             strategy=order.strategy,
             magic=order.magic,
         )
-        trade._last_swap_day = order.created_at.normalize() if order.created_at is not None else None
+        trade._last_swap_day = fill_time.normalize()
         return trade, equity
 
     def _maybe_close_trade(
@@ -1458,9 +1469,18 @@ class Backtester:
 
             order = self._create_order_from_signal(strategy, filtered_sig, row, risk_perc, equity)
             if order:
+                order.created_at = self._execution_timestamp(strategy, ts)
                 all_orders.append(order)
                 working_orders.append(order)
         return equity, gross_equity, open_trades, working_orders
+
+    def _execution_timestamp(self, strategy: BaseStrategy, ts: pd.Timestamp) -> pd.Timestamp:
+        event_ts = pd.Timestamp(ts)
+        event_ts = event_ts.tz_localize("UTC") if event_ts.tzinfo is None else event_ts.tz_convert("UTC")
+        delta = self._timeframe_to_timedelta(getattr(strategy, "timeframe", ""))
+        if delta is None:
+            return event_ts
+        return event_ts + delta
 
     @staticmethod
     def _serialize_signal_intent(
