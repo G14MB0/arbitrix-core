@@ -3,7 +3,7 @@
 * :class:`NoMargin` — for cash FX / crypto / anything not margined.
 * :class:`FuturesUSDMargin` — flat per-contract requirement (CME-style).
 * :class:`RegTMargin` — initial 50%, maintenance 25% of notional (US equities).
-* :class:`CFDMargin` — notional / leverage; leverage defaults to 20.
+* :class:`CFDMargin` — quantity * contract size * price / leverage.
 
 All return :class:`Money` with currency ``"USD"`` for now — Sub-spec 2 ships
 USD-only; multi-currency settlement is a Sub-spec 3 concern.
@@ -103,13 +103,17 @@ class CFDMargin:
     """
 
     leverage: float = 20.0
+    contract_size: float = 1.0
 
     def __post_init__(self) -> None:
         if self.leverage <= 0:
             raise ValueError(f"CFDMargin leverage must be > 0, got {self.leverage}")
+        if self.contract_size <= 0:
+            raise ValueError(f"CFDMargin contract_size must be > 0, got {self.contract_size}")
 
     def initial(self, symbol: str, qty: float, price: float) -> Money:
-        notional = abs(qty) * price
+        # qty is broker lots/contracts. Convert to underlying notional first.
+        notional = abs(qty) * self.contract_size * price
         return Money(amount=notional / self.leverage, currency="USD")
 
     def maintenance(self, symbol: str, qty: float, price: float) -> Money:

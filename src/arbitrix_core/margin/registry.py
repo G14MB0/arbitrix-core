@@ -55,6 +55,7 @@ class MarginParams:
     overnight_initial_per_contract: Optional[float] = None
     overnight_maintenance_per_contract: Optional[float] = None
     leverage: Optional[float] = None
+    contract_size: Optional[float] = None
 
 
 _PARAMS: Dict[str, MarginParams] = {}
@@ -128,5 +129,6 @@ def resolve_margin_model(params: MarginParams) -> MarginModel:
         return RegTMargin()
     if mid == "cfd_20x":
         leverage = params.leverage if params.leverage is not None else 20.0
-        return CFDMargin(leverage=leverage)
+        contract_size = params.contract_size if params.contract_size is not None else 1.0
+        return CFDMargin(leverage=leverage, contract_size=contract_size)
     raise ValueError(f"unknown margin model id: {mid!r}")

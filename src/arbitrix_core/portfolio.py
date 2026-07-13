@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
+import math
 import threading
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
@@ -496,6 +497,63 @@ class Portfolio:
                 self._bump()
                 return True
         return False
+
+    def sync_trade_from_broker(
+        self,
+        trade_id: str,
+        *,
+        volume: Optional[float] = None,
+        entry_price: Optional[float] = None,
+        stop_loss: Optional[float] = None,
+        take_profit: Optional[float] = None,
+        current_price: Optional[float] = None,
+        sync_stop_loss: bool = False,
+        sync_take_profit: bool = False,
+    ) -> Dict[str, tuple[float, float]]:
+        """Apply authoritative broker position fields to one open trade."""
+        changes: Dict[str, tuple[float, float]] = {}
+        with self._lock:
+            market_updated = False
+            trade = next((item for item in self._open_trades if item.id == trade_id), None)
+            if trade is None:
+                return changes
+            if volume is not None and math.isfinite(float(volume)) and float(volume) > 0:
+                new_volume = float(volume)
+                if not math.isclose(float(trade.volume), new_volume, rel_tol=0.0, abs_tol=1e-12):
+                    changes["volume"] = (float(trade.volume), new_volume)
+                    trade.volume = new_volume
+                    for order in self._orders:
+                        if order.id == trade.order_id:
+                            order.volume = new_volume
+                            break
+            if entry_price is not None and math.isfinite(float(entry_price)) and float(entry_price) > 0:
+                new_entry = float(entry_price)
+                if not math.isclose(float(trade.entry_price), new_entry, rel_tol=0.0, abs_tol=1e-12):
+                    changes["entry_price"] = (float(trade.entry_price), new_entry)
+                    trade.entry_price = new_entry
+            if sync_stop_loss:
+                new_stop_points = 0.0
+                if stop_loss is not None and math.isfinite(float(stop_loss)) and float(stop_loss) > 0:
+                    new_stop_points = self._points_from_price(trade, float(stop_loss), kind="sl")
+                if not math.isclose(float(trade.stop_points or 0.0), new_stop_points, rel_tol=0.0, abs_tol=1e-12):
+                    changes["stop_points"] = (float(trade.stop_points or 0.0), new_stop_points)
+                    trade.stop_points = new_stop_points
+            if sync_take_profit:
+                new_take_points = 0.0
+                if take_profit is not None and math.isfinite(float(take_profit)) and float(take_profit) > 0:
+                    new_take_points = self._points_from_price(trade, float(take_profit), kind="tp")
+                if not math.isclose(float(trade.take_points or 0.0), new_take_points, rel_tol=0.0, abs_tol=1e-12):
+                    changes["take_points"] = (float(trade.take_points or 0.0), new_take_points)
+                    trade.take_points = new_take_points
+            if current_price is not None and math.isfinite(float(current_price)) and float(current_price) > 0:
+                new_market_price = float(current_price)
+                previous_market_price = self._last_prices.get(trade.symbol)
+                market_updated = previous_market_price != new_market_price
+                self._last_prices[trade.symbol] = new_market_price
+            if changes or market_updated:
+                self._recalc_mark_to_market()
+                self._bump()
+        return changes
 
     def update_order_stops(
         self,
