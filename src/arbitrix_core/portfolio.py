@@ -768,6 +768,17 @@ class Portfolio:
                 self._closed_trades = [trade for trade in self._closed_trades if not _is_synthetic_trade(trade)]
                 self._equity -= closed_pnl
                 self._gross_equity -= closed_gross
+            # Entry costs are booked immediately when a synthetic trade opens.
+            # Closing and the PnL rollback above do not reverse that original
+            # debit. Restore it for every removed synthetic trade exactly once.
+            removed_trade_cost_effect = sum(
+                float(getattr(trade, "commission_paid", 0.0) or 0.0)
+                + float(getattr(trade, "spread_cost", 0.0) or 0.0)
+                + float(getattr(trade, "slippage_cost", 0.0) or 0.0)
+                - float(getattr(trade, "swap_pnl", 0.0) or 0.0)
+                for trade in (*removed_open, *removed_closed)
+            )
+            self._equity += removed_trade_cost_effect
             if removed_pending:
                 self._pending_orders = [order for order in self._pending_orders if not _is_synthetic_order(order)]
             if removed_orders:
