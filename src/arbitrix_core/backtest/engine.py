@@ -1279,7 +1279,14 @@ class Backtester:
         # below min_order_size. Non-FUT keeps legacy round-to-2 behavior.
         # See docs/risk/position-sizing.md for the rule.
         if volume is None:
-            risk_dollars = equity * risk_perc * signal.risk_multiplier
+            try:
+                risk_multiplier = float(signal.risk_multiplier)
+            except (TypeError, ValueError):
+                return None
+            if not math.isfinite(risk_multiplier):
+                return None
+            risk_multiplier = min(max(risk_multiplier, 0.0), 1.0)
+            risk_dollars = equity * risk_perc * risk_multiplier
             raw = risk_dollars / (point_value * stop_points)
             try:
                 from arbitrix_core.symbols.context import get_symbol_context
@@ -1290,9 +1297,9 @@ class Backtester:
                         return None
                     volume = float(floored)
                 else:
-                    volume = round(raw, 2)
+                    volume = math.floor((max(raw, 0.0) + 1e-12) * 100.0) / 100.0
             except (KeyError, ImportError):
-                volume = round(raw, 2)
+                volume = math.floor((max(raw, 0.0) + 1e-12) * 100.0) / 100.0
         if volume <= 0:
             return None
 

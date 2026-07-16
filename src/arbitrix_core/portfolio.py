@@ -823,6 +823,7 @@ class Portfolio:
         timestamp: pd.Timestamp,
         *,
         check_stops: bool = False,
+        process_pending: bool = True,
         stop_priority: str = "sl_first",
     ) -> None:
         with self._lock:
@@ -833,7 +834,8 @@ class Portfolio:
             self._recalc_mark_to_market()
         if check_stops:
             self._check_open_trade_stops(symbol, row, timestamp, stop_priority=stop_priority)
-        self.process_pending_orders(symbol, row, timestamp)
+        if process_pending:
+            self.process_pending_orders(symbol, row, timestamp)
 
     def _check_open_trade_stops(
         self,
@@ -917,7 +919,7 @@ class Portfolio:
                     updated = True
                     continue
                 created_at = _normalize_ts(order.created_at)
-                if order.type != "market" and created_at is not None and created_at >= ts:
+                if order.type != "market" and created_at is not None and created_at > ts:
                     order.status = "working"
                     still_pending.append(order)
                     continue
@@ -1150,7 +1152,9 @@ class Portfolio:
         trade = Trade(
             symbol=order.symbol,
             side="long" if order.side == "buy" else "short",
-            entry_time=order.created_at or fill_time,
+            # Order creation and execution are different events. Using
+            # created_at here backdates pending fills and breaks broker truth.
+            entry_time=fill_time,
             entry_price=float(fill_price),
             volume=float(order.volume),
             stop_points=float(order.stop_points),
