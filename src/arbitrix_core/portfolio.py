@@ -606,6 +606,12 @@ class Portfolio:
             trade.exit_time = exit_time
             trade.exit_price = float(exit_price)
             trade.notes[f"exit_{reason}"] = 1.0
+            if reason == "stop_loss":
+                trade.notes["exit_stop"] = 1.0
+                trade.notes["exit_take"] = 0.0
+            elif reason == "take_profit":
+                trade.notes["exit_stop"] = 0.0
+                trade.notes["exit_take"] = 1.0
             pnl = self._calc_trade_pnl(trade, float(exit_price))
             trade.gross_pnl = pnl
             trade.pnl = pnl

@@ -722,6 +722,7 @@ class Backtester:
             if runtime_breakdown_enabled:
                 loop_breakdown["on_bar_s"] += max(0.0, time.monotonic() - section_started)
             section_started = time.monotonic() if runtime_breakdown_enabled else 0.0
+            order_count_before_signals = len(all_orders)
             equity, gross_equity, open_trades, working_orders = self._apply_bar_signals(
                 strategy=strategy,
                 signals=bar_signals,
@@ -737,6 +738,7 @@ class Backtester:
                 gross_equity=gross_equity,
                 signal_intents=signal_intents,
             )
+            newly_created_orders = list(all_orders[order_count_before_signals:])
             if runtime_breakdown_enabled:
                 loop_breakdown["apply_signals_s"] += max(0.0, time.monotonic() - section_started)
 
@@ -816,6 +818,7 @@ class Backtester:
                         "equity": float(equity),
                         "gross_equity": float(gross_equity),
                         "bar_signals": list(bar_signals) if bar_signals else [],
+                        "newly_created_orders": newly_created_orders,
                         "newly_filled": list(newly_filled_at_open) + list(newly_filled),
                         # ARB-129 iter-5: parallel to newly_filled, exposes the
                         # source Order for each filled Trade so observers can
