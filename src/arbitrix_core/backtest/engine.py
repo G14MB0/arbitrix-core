@@ -408,7 +408,11 @@ class Backtester:
             raise ValueError("Strategy.prepare() must return a DataFrame.")
         if not rolling_prepare:
             section_started = time.monotonic() if runtime_breakdown_enabled else 0.0
-            prepared = self._preserve_prepared_columns(df, prepared, columns=("spread", "__regime_output__"))
+            prepared = self._preserve_prepared_columns(
+                df,
+                prepared,
+                columns=("spread", "__regime_output__", "__account_point_value__"),
+            )
             if runtime_breakdown_enabled:
                 prepare_breakdown["preserve_columns_s"] += max(
                     0.0,
@@ -609,7 +613,7 @@ class Backtester:
                 current_prepared = self._preserve_prepared_columns(
                     window,
                     current_prepared,
-                    columns=("spread", "__regime_output__"),
+                    columns=("spread", "__regime_output__", "__account_point_value__"),
                 )
                 if runtime_breakdown_enabled:
                     prepare_breakdown["preserve_columns_s"] += max(
@@ -655,7 +659,7 @@ class Backtester:
             section_started = time.monotonic() if runtime_breakdown_enabled else 0.0
             pre_sl_trades: List[Trade] = []
             for trade in open_trades:
-                swap_delta = self._apply_overnight_swap(symbol, trade, day, swap_override)
+                swap_delta = self._apply_overnight_swap(symbol, trade, row, day, swap_override)
                 if swap_delta:
                     equity += swap_delta
                 pre_sl_trades.append(trade)
@@ -875,7 +879,7 @@ class Backtester:
         else:
             # Force close remaining trades at last bar
             for trade in list(open_trades):
-                swap_delta = self._apply_overnight_swap(symbol, trade, day, swap_override)
+                swap_delta = self._apply_overnight_swap(symbol, trade, last_row, day, swap_override)
                 if swap_delta:
                     equity += swap_delta
                 equity, gross_equity, _ = self._close_trade(
@@ -1243,7 +1247,7 @@ class Backtester:
     def _unrealized_pnl(self, symbol: str, trades: List[Trade], row: pd.Series) -> float:
         if not trades:
             return 0.0
-        pv = costs.get_point_value(symbol)
+        pv = self._account_point_value(symbol, row)
         if pv == 0:
             return 0.0
         pnl = 0.0
@@ -1267,7 +1271,7 @@ class Backtester:
         if stop_points <= 0:
             return None
         take_points = float(strategy.take_distance_points(row))
-        point_value = costs.get_point_value(symbol)
+        point_value = self._account_point_value(symbol, row)
         if point_value <= 0:
             return None
 
@@ -1374,10 +1378,10 @@ class Backtester:
         fill_time: pd.Timestamp,
         equity: float,
     ) -> tuple[Optional[Trade], float]:
-        commission = costs.commission_one_side(symbol, float(fill_price), order.volume)
+        commission = self._commission_one_side(symbol, row, float(fill_price), order.volume)
         spread_cost = self._half_spread_cost(symbol, row, order.volume)
         slippage_points = self._slippage_points(symbol, row)
-        slippage_cost_val = costs.slippage_cost(symbol, slippage_points, order.volume)
+        slippage_cost_val = self._slippage_cost(symbol, row, slippage_points, order.volume)
         equity -= commission + spread_cost + slippage_cost_val
 
         trade = Trade(
@@ -1408,7 +1412,7 @@ class Backtester:
         gross_equity: float,
         trades: List[Trade],
     ) -> tuple[float, float, Optional[Trade]]:
-        pv = costs.get_point_value(symbol)
+        pv = self._account_point_value(symbol, row)
         if pv == 0:
             return equity, gross_equity, trade
         if not self.cfg.apply_stop_take:
@@ -1455,10 +1459,10 @@ class Backtester:
                 fill = take_price if take_price is not None else row["close"]
                 pnl = (trade.entry_price - fill) * pv * trade.volume
 
-        commission = costs.commission_one_side(symbol, float(fill), trade.volume)
+        commission = self._commission_one_side(symbol, row, float(fill), trade.volume)
         spread_cost = self._half_spread_cost(symbol, row, trade.volume)
         slippage_points = self._slippage_points(symbol, row)
-        slippage_cost_val = costs.slippage_cost(symbol, slippage_points, trade.volume)
+        slippage_cost_val = self._slippage_cost(symbol, row, slippage_points, trade.volume)
         trade.exit_time = ts
         trade.exit_price = float(fill)
         trade.gross_pnl = pnl
@@ -1493,7 +1497,7 @@ class Backtester:
         if not self.cfg.apply_stop_take or not trades_to_check:
             return trades_to_check, equity, gross_equity
 
-        pv = costs.get_point_value(symbol)
+        pv = self._account_point_value(symbol, row)
         if pv == 0:
             return trades_to_check, equity, gross_equity
 
@@ -1538,10 +1542,10 @@ class Backtester:
             else:
                 pnl = (trade.entry_price - fill) * pv * trade.volume
 
-            commission = costs.commission_one_side(symbol, fill, trade.volume)
+            commission = self._commission_one_side(symbol, row, fill, trade.volume)
             spread_cost = self._half_spread_cost(symbol, row, trade.volume)
             slippage_pts = self._slippage_points(symbol, row)
-            slippage_cost_val = costs.slippage_cost(symbol, slippage_pts, trade.volume)
+            slippage_cost_val = self._slippage_cost(symbol, row, slippage_pts, trade.volume)
 
             trade.exit_time = ts
             trade.exit_price = fill
@@ -1675,7 +1679,7 @@ class Backtester:
         trades: List[Trade],
         reason: str = "force",
     ) -> tuple[float, float, Optional[Trade]]:
-        pv = costs.get_point_value(symbol)
+        pv = self._account_point_value(symbol, row)
         if pv == 0:
             return equity, gross_equity, trade
         fill_price = row["open"] if self.cfg.exit_fill_price == "open" else row["close"]
@@ -1683,10 +1687,10 @@ class Backtester:
             pnl = (fill_price - trade.entry_price) * pv * trade.volume
         else:
             pnl = (trade.entry_price - fill_price) * pv * trade.volume
-        commission = costs.commission_one_side(symbol, float(fill_price), trade.volume)
+        commission = self._commission_one_side(symbol, row, float(fill_price), trade.volume)
         spread_cost = self._half_spread_cost(symbol, row, trade.volume)
         slippage_points = self._slippage_points(symbol, row)
-        slippage_cost_val = costs.slippage_cost(symbol, slippage_points, trade.volume)
+        slippage_cost_val = self._slippage_cost(symbol, row, slippage_points, trade.volume)
         trade.exit_time = ts
         trade.exit_price = float(fill_price)
         trade.gross_pnl = pnl
@@ -1809,7 +1813,7 @@ class Backtester:
         reason: str,
     ) -> tuple[float, float, Optional[Trade]]:
         symbol = trade.symbol
-        pv = costs.get_point_value(symbol)
+        pv = self._account_point_value(symbol, row)
         if pv == 0:
             return equity, gross_equity, trade
         fill_price = row["open"] if self.cfg.exit_fill_price == "open" else row["close"]
@@ -1829,10 +1833,10 @@ class Backtester:
         entry_slippage = trade.slippage_cost * entry_ratio
         entry_swap = trade.swap_pnl * entry_ratio
 
-        close_commission = costs.commission_one_side(symbol, float(fill_price), target)
+        close_commission = self._commission_one_side(symbol, row, float(fill_price), target)
         close_spread = self._half_spread_cost(symbol, row, target)
         slippage_points = self._slippage_points(symbol, row)
-        close_slippage = costs.slippage_cost(symbol, slippage_points, target)
+        close_slippage = self._slippage_cost(symbol, row, slippage_points, target)
 
         closed_trade = Trade(
             symbol=trade.symbol,
@@ -1898,7 +1902,40 @@ class Backtester:
         spread_points = self._spread_points(row)
         if spread_points <= 0.0:
             return 0.0
-        return costs.spread_cost(symbol, spread_points, volume) / 2.0
+        with costs.using_point_value(symbol, self._account_point_value(symbol, row)):
+            return costs.spread_cost(symbol, spread_points, volume) / 2.0
+
+    def _slippage_cost(
+        self,
+        symbol: str,
+        row: pd.Series,
+        slippage_points: float,
+        volume: float,
+    ) -> float:
+        with costs.using_point_value(symbol, self._account_point_value(symbol, row)):
+            return costs.slippage_cost(symbol, slippage_points, volume)
+
+    def _commission_one_side(
+        self,
+        symbol: str,
+        row: pd.Series,
+        price: float,
+        volume: float,
+    ) -> float:
+        with costs.using_point_value(symbol, self._account_point_value(symbol, row)):
+            return costs.commission_one_side(symbol, price, volume)
+
+    @staticmethod
+    def _account_point_value(symbol: str, row: pd.Series) -> float:
+        if hasattr(row, "get"):
+            candidate = row.get("__account_point_value__")
+            try:
+                value = float(candidate)
+            except (TypeError, ValueError):
+                value = float("nan")
+            if math.isfinite(value) and value > 0:
+                return value
+        return costs.get_point_value(symbol)
 
     def _tick_size(self, symbol: str) -> float:
         inst = self.instruments.get(symbol)
@@ -1910,6 +1947,7 @@ class Backtester:
         self,
         symbol: str,
         trade: Trade,
+        row: pd.Series,
         current_day: pd.Timestamp,
         swap_override: Optional[dict],
     ) -> float:
@@ -1926,7 +1964,13 @@ class Backtester:
             override = dict(swap_override or {})
             if weekend and "weekend" not in override:
                 override["weekend"] = True
-            swap_delta = costs.swap_cost_per_day(symbol, trade.volume, direction, static_override=override)
+            with costs.using_point_value(symbol, self._account_point_value(symbol, row)):
+                swap_delta = costs.swap_cost_per_day(
+                    symbol,
+                    trade.volume,
+                    direction,
+                    static_override=override,
+                )
             trade.swap_pnl += swap_delta
             delta_total += swap_delta
         return delta_total

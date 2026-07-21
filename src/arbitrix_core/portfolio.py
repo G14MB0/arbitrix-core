@@ -3,9 +3,10 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
+import logging
 import math
 import threading
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import pandas as pd
 
@@ -17,6 +18,9 @@ from arbitrix_core.margin import (
     resolve_margin_model,
 )
 from arbitrix_core.trading import Order, Trade
+
+
+logger = logging.getLogger(__name__)
 
 
 def _margin_model_for_symbol(symbol: str):
@@ -65,7 +69,13 @@ class PortfolioSnapshot:
 class Portfolio:
     """Shared portfolio view used by backtest and live runtimes."""
 
-    def __init__(self, *, initial_equity: float = 0.0, equity_source: str = "engine") -> None:
+    def __init__(
+        self,
+        *,
+        initial_equity: float = 0.0,
+        equity_source: str = "engine",
+        point_value_resolver: Optional[Callable[[str, float], float]] = None,
+    ) -> None:
         self._equity = float(initial_equity)
         self._gross_equity = float(initial_equity)
         self._equity_marked = float(initial_equity)
@@ -81,6 +91,9 @@ class Portfolio:
         self._version = 0
         self._exposure_cache: Dict[Tuple[str, Optional[str], Optional[pd.Timestamp], int], Dict[str, Any]] = {}
         self._last_prices: Dict[str, float] = {}
+        self._point_value_resolver = point_value_resolver
+        self._unrealized_pnl_by_trade: Dict[str, float] = {}
+        self._valuation_warning_trade_ids: set[str] = set()
         # Portfolio-level margin cap, set by the engine at boot from
         # :attr:`BTConfig.max_margin_utilization` (Sub-spec 2 / Task 20).
         # Default 1.0 = no cap beyond per-symbol margin_available check.
@@ -89,6 +102,24 @@ class Portfolio:
     def _bump(self) -> None:
         self._version += 1
         self._exposure_cache.clear()
+
+    def resolve_point_value(self, symbol: str, price: float) -> float:
+        resolver = self._point_value_resolver
+        if resolver is not None:
+            value = float(resolver(symbol, float(price)))
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(
+                    f"Invalid account point value for {symbol}: {value!r}"
+                )
+            return value
+
+        import arbitrix_core.costs as costs
+
+        try:
+            value = float(costs.get_point_value(symbol))
+        except Exception:
+            value = 1.0
+        return value if math.isfinite(value) and value > 0 else 1.0
 
     @property
     def equity(self) -> float:
@@ -599,8 +630,21 @@ class Portfolio:
                 return True
         return False
 
-    def close_trade(self, trade: Trade, *, exit_price: float, exit_time: pd.Timestamp, reason: str) -> None:
+    def close_trade(
+        self,
+        trade: Trade,
+        *,
+        exit_price: float,
+        exit_time: pd.Timestamp,
+        reason: str,
+        gross_pnl_override: Optional[float] = None,
+    ) -> None:
         with self._lock:
+            pnl = (
+                float(gross_pnl_override)
+                if gross_pnl_override is not None
+                else self._calc_trade_pnl(trade, float(exit_price))
+            )
             if trade in self._open_trades:
                 self._open_trades.remove(trade)
             trade.exit_time = exit_time
@@ -612,7 +656,6 @@ class Portfolio:
             elif reason == "take_profit":
                 trade.notes["exit_stop"] = 0.0
                 trade.notes["exit_take"] = 1.0
-            pnl = self._calc_trade_pnl(trade, float(exit_price))
             trade.gross_pnl = pnl
             trade.pnl = pnl
             trade.net_pnl = pnl
@@ -630,15 +673,29 @@ class Portfolio:
         exit_time: pd.Timestamp,
         reason: str = "signal_exit",
         close_volume: Optional[float] = None,
+        gross_pnl_override: Optional[float] = None,
     ) -> Optional[Trade]:
         with self._lock:
             trade = self.get_trade_by_id(trade_id)
             if trade is None:
                 return None
             if close_volume is None or close_volume >= trade.volume:
-                self.close_trade(trade, exit_price=exit_price, exit_time=exit_time, reason=reason)
+                self.close_trade(
+                    trade,
+                    exit_price=exit_price,
+                    exit_time=exit_time,
+                    reason=reason,
+                    gross_pnl_override=gross_pnl_override,
+                )
                 return trade
-            return self._partial_close_trade(trade, close_volume, exit_price, exit_time, reason)
+            return self._partial_close_trade(
+                trade,
+                close_volume,
+                exit_price,
+                exit_time,
+                reason,
+                gross_pnl_override=gross_pnl_override,
+            )
 
     def apply_trade_outcome_overrides(
         self,
@@ -1179,25 +1236,13 @@ class Portfolio:
         return trade
 
     def _calc_trade_pnl(self, trade: Trade, exit_price: float) -> float:
-        import arbitrix_core.costs as costs
-        try:
-            point_value = costs.get_point_value(trade.symbol)
-        except Exception:
-            point_value = 1.0
-        if not point_value:
-            point_value = 1.0
+        point_value = self.resolve_point_value(trade.symbol, exit_price)
         if trade.side == "long":
             return (exit_price - trade.entry_price) * point_value * trade.volume
         return (trade.entry_price - exit_price) * point_value * trade.volume
 
     def _calc_trade_pnl_volume(self, trade: Trade, exit_price: float, volume: float) -> float:
-        import arbitrix_core.costs as costs
-        try:
-            point_value = costs.get_point_value(trade.symbol)
-        except Exception:
-            point_value = 1.0
-        if not point_value:
-            point_value = 1.0
+        point_value = self.resolve_point_value(trade.symbol, exit_price)
         if trade.side == "long":
             return (exit_price - trade.entry_price) * point_value * volume
         return (trade.entry_price - exit_price) * point_value * volume
@@ -1209,6 +1254,7 @@ class Portfolio:
         exit_price: float,
         exit_time: pd.Timestamp,
         reason: str,
+        gross_pnl_override: Optional[float] = None,
     ) -> Optional[Trade]:
         if volume <= 0:
             return None
@@ -1237,7 +1283,11 @@ class Portfolio:
         closed_trade.exit_price = float(exit_price)
         closed_trade.notes.update(dict(getattr(trade, "notes", {}) or {}))
         closed_trade.notes[f"exit_{reason}"] = 1.0
-        closed_trade.gross_pnl = self._calc_trade_pnl_volume(trade, float(exit_price), volume)
+        closed_trade.gross_pnl = (
+            float(gross_pnl_override)
+            if gross_pnl_override is not None
+            else self._calc_trade_pnl_volume(trade, float(exit_price), volume)
+        )
         total_costs = closed_trade.commission_paid + closed_trade.spread_cost + closed_trade.slippage_cost
         closed_trade.pnl = closed_trade.gross_pnl - total_costs
         closed_trade.net_pnl = closed_trade.gross_pnl - total_costs + closed_trade.swap_pnl
@@ -1266,10 +1316,37 @@ class Portfolio:
         return (price - trade.entry_price) if kind == "sl" else (trade.entry_price - price)
 
     def _recalc_mark_to_market(self) -> None:
-        unrealized = 0.0
+        open_trade_ids = {str(trade.id) for trade in self._open_trades}
+        self._unrealized_pnl_by_trade = {
+            trade_id: pnl
+            for trade_id, pnl in self._unrealized_pnl_by_trade.items()
+            if trade_id in open_trade_ids
+        }
+        self._valuation_warning_trade_ids.intersection_update(open_trade_ids)
         for trade in self._open_trades:
             last_price = self._last_prices.get(trade.symbol)
             if last_price is None:
                 continue
-            unrealized += self._calc_trade_pnl(trade, last_price)
-        self._equity_marked = self._equity + unrealized
+            trade_id = str(trade.id)
+            try:
+                self._unrealized_pnl_by_trade[trade_id] = self._calc_trade_pnl(
+                    trade,
+                    last_price,
+                )
+            except Exception:
+                if self._point_value_resolver is None:
+                    raise
+                if trade_id not in self._valuation_warning_trade_ids:
+                    logger.warning(
+                        "Live mark-to-market valuation unavailable for %s/%s; "
+                        "preserving the last calculated unrealized PnL",
+                        trade.symbol,
+                        trade_id,
+                        exc_info=True,
+                    )
+                    self._valuation_warning_trade_ids.add(trade_id)
+            else:
+                self._valuation_warning_trade_ids.discard(trade_id)
+        self._equity_marked = self._equity + sum(
+            self._unrealized_pnl_by_trade.values()
+        )

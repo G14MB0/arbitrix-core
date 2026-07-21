@@ -3,6 +3,8 @@ from __future__ import annotations
 import logging
 import threading
 import math
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING
 
 from arbitrix_core.types import InstrumentConfig
@@ -21,6 +23,8 @@ __all__ = [
     "get_instruments",
     "get_point_overrides",
     "get_point_value",
+    "using_point_value",
+    "using_tick_size",
     "get_instrument",
     "trade_notional",
     "tick_size",
@@ -42,6 +46,14 @@ _ALLOW_PROVIDER_LOOKUPS = True
 _COMMISSION_PER_LOT = 3.0
 MIN_COMMISSION = 1e-6
 _LOCK = threading.Lock()
+_POINT_VALUE_CONTEXT: ContextVar[Optional[tuple[str, float]]] = ContextVar(
+    "arbitrix_cost_point_value",
+    default=None,
+)
+_TICK_SIZE_CONTEXT: ContextVar[Optional[tuple[str, float]]] = ContextVar(
+    "arbitrix_cost_tick_size",
+    default=None,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -212,12 +224,13 @@ def _point_value_from_symbol_info(info: Dict[str, Any]) -> Optional[float]:
         if raw is None or raw <= 0:
             continue
         candidate = abs(raw)
+
         # Some brokers report tick value for min volume < 1; scale up to 1.0 lot.
         if volume_min is not None and 0 < volume_min < 1.0 and candidate < 1.0:
             scaled = candidate / volume_min
             if scaled > candidate:
                 candidate = scaled
-        
+
         # If we have tick value and tick size, we can calculate multiplier (point value)
         if point_size is not None and point_size > 0:
             try:
@@ -275,6 +288,9 @@ def _resolve_point_value(symbol: str) -> Optional[float]:
 
 
 def get_point_value(symbol: str) -> float:
+    contextual = _POINT_VALUE_CONTEXT.get()
+    if contextual is not None and contextual[0] == str(symbol).lower():
+        return contextual[1]
     # ARB / Sub-spec 1: prefer SymbolContext when registered; fall back to legacy
     # provider/instrument/override chain so existing call sites keep working.
     # See docs/symbols/futures.md for the registration model.
@@ -304,12 +320,29 @@ def get_point_value(symbol: str) -> float:
     return value
 
 
+@contextmanager
+def using_point_value(symbol: str, value: float):
+    """Temporarily value point-based costs with a per-bar account value."""
+
+    numeric = float(value)
+    if not math.isfinite(numeric) or numeric <= 0:
+        raise ValueError("point value override must be finite and greater than zero")
+    token = _POINT_VALUE_CONTEXT.set((str(symbol).lower(), numeric))
+    try:
+        yield
+    finally:
+        _POINT_VALUE_CONTEXT.reset(token)
+
+
 def trade_notional(symbol: str, price: float, volume_lot: float) -> float:
     pv = get_point_value(symbol)
     return abs(price) * pv * abs(volume_lot)
 
 
 def tick_size(symbol: str) -> float:
+    contextual = _TICK_SIZE_CONTEXT.get()
+    if contextual is not None and contextual[0] == str(symbol).lower():
+        return contextual[1]
     cache_key = str(symbol).lower()
     with _LOCK:
         cached = _TICK_SIZE_CACHE.get(cache_key)
@@ -332,6 +365,20 @@ def tick_size(symbol: str) -> float:
     with _LOCK:
         _TICK_SIZE_CACHE[cache_key] = value
     return value
+
+
+@contextmanager
+def using_tick_size(symbol: str, value: float):
+    """Temporarily value point-based costs with an effective symbol tick size."""
+
+    numeric = float(value)
+    if not math.isfinite(numeric) or numeric <= 0:
+        raise ValueError("tick size override must be finite and greater than zero")
+    token = _TICK_SIZE_CONTEXT.set((str(symbol).lower(), numeric))
+    try:
+        yield
+    finally:
+        _TICK_SIZE_CONTEXT.reset(token)
 
 
 # ---------------------------------------------------------------------------
@@ -634,4 +681,3 @@ def import_caches(data: Dict[str, Any]) -> None:
     for key, value in swap_cache.items():
         if isinstance(key, (list, tuple)) and len(key) == 2:
             _SWAP_POINTS_CACHE[(str(key[0]).lower(), key[1])] = float(value)
-
