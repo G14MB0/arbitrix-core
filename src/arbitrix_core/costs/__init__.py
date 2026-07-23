@@ -267,6 +267,14 @@ def get_point_value(symbol: str) -> float:
     return base.get_point_value(symbol)
 
 
+def using_point_value(symbol: str, value: float):
+    return base.using_point_value(symbol, value)
+
+
+def using_tick_size(symbol: str, value: float):
+    return base.using_tick_size(symbol, value)
+
+
 def set_commission_per_lot(value: float) -> None:
     base.set_commission_per_lot(value)
 
@@ -357,6 +365,8 @@ __all__ = [
     "swap_cost_per_day",
     "warmup_from_provider",
     "get_point_value",
+    "using_point_value",
+    "using_tick_size",
     "set_commission_per_lot",
     "get_commission_per_lot",
     "commission_minimum",
