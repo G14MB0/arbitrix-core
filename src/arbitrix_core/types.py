@@ -41,6 +41,9 @@ class InstrumentConfig:
     point_value: Optional[float] = None
     contract_size: Optional[float] = None
     tick_size: Optional[float] = None
+    # Full bid/ask spread expressed in quote-price units (for example,
+    # 0.00020 for a two-pip EURUSD spread). None uses the provider spread.
+    target_spread: Optional[float] = None
     commission_rate: Optional[float] = None
     commission_min: Optional[float] = None
     cost_model: Optional[str] = None

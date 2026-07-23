@@ -16,6 +16,8 @@ from arbitrix_core.margin import (
     get_margin_params,
     resolve_margin_model,
 )
+from arbitrix_core.symbols.context import get_symbol_context
+from arbitrix_core.symbols.spread_pricing import translate_reference_price
 from arbitrix_core.trading import Order, Trade
 
 
@@ -877,7 +879,43 @@ class Portfolio:
                 sl_hit = False
                 tp_hit = False
 
-                if trade.side == "long":
+                if trade.spread_aware_pending:
+                    sl_price = trade.protective_stop_price
+                    tp_price = trade.protective_take_price
+                    quote_low = low
+                    quote_high = high
+                    try:
+                        ctx = get_symbol_context(symbol)
+                        spread_points = float(row.get("spread", 0.0) or 0.0)
+                        spread_price = max(spread_points, 0.0) * float(ctx.tick_size)
+                        if spread_price <= 0.0 and ctx.target_spread is not None:
+                            spread_price = float(ctx.target_spread)
+                        if spread_price > 0.0:
+                            close_action = (
+                                "sell" if trade.side == "long" else "buy"
+                            )
+                            quote_low = translate_reference_price(
+                                reference_price=low,
+                                action=close_action,
+                                spread_price=spread_price,
+                                reference_basis=str(trade.reference_basis),
+                            )
+                            quote_high = translate_reference_price(
+                                reference_price=high,
+                                action=close_action,
+                                spread_price=spread_price,
+                                reference_basis=str(trade.reference_basis),
+                            )
+                    except (KeyError, TypeError, ValueError):
+                        quote_low = low
+                        quote_high = high
+                    if trade.side == "long":
+                        sl_hit = sl_price is not None and quote_low <= sl_price
+                        tp_hit = tp_price is not None and quote_high >= tp_price
+                    else:
+                        sl_hit = sl_price is not None and quote_high >= sl_price
+                        tp_hit = tp_price is not None and quote_low <= tp_price
+                elif trade.side == "long":
                     if stop_points > 0.0:
                         sl_price = float(trade.entry_price) - stop_points
                         sl_hit = low <= sl_price
@@ -930,23 +968,55 @@ class Portfolio:
                     still_pending.append(order)
                     continue
                 price = order.price if order.price is not None else close
+                order_low = low
+                order_high = high
+                spread_price = 0.0
+                if order.reference_basis is not None:
+                    try:
+                        ctx = get_symbol_context(symbol)
+                        spread_points = float(row.get("spread", 0.0) or 0.0)
+                        spread_price = max(spread_points, 0.0) * float(ctx.tick_size)
+                        if spread_price <= 0.0 and ctx.target_spread is not None:
+                            spread_price = float(ctx.target_spread)
+                        if spread_price > 0.0:
+                            order_low = translate_reference_price(
+                                reference_price=low,
+                                action=order.side,
+                                spread_price=spread_price,
+                                reference_basis=order.reference_basis,
+                            )
+                            order_high = translate_reference_price(
+                                reference_price=high,
+                                action=order.side,
+                                spread_price=spread_price,
+                                reference_basis=order.reference_basis,
+                            )
+                    except (KeyError, TypeError, ValueError):
+                        order_low = low
+                        order_high = high
                 filled = False
                 fill_price = price
                 if order.type == "market":
                     filled = True
                     fill_price = close
                 elif order.type == "limit":
-                    if order.side == "buy" and low <= price:
+                    if order.side == "buy" and order_low <= price:
                         filled = True
-                    elif order.side == "sell" and high >= price:
+                    elif order.side == "sell" and order_high >= price:
                         filled = True
                 elif order.type == "stop":
-                    if order.side == "buy" and high >= price:
+                    if order.side == "buy" and order_high >= price:
                         filled = True
-                    elif order.side == "sell" and low <= price:
+                    elif order.side == "sell" and order_low <= price:
                         filled = True
                 if filled:
                     order.status = "filled"
+                    if (
+                        order.reference_basis is not None
+                        and order.effective_spread_price <= 0.0
+                        and spread_price > 0.0
+                    ):
+                        order.effective_spread_price = float(spread_price)
                     trade = self._open_trade_from_order(order, fill_price=fill_price, fill_time=ts)
                     if trade is not None:
                         self._open_trades.append(trade)
@@ -1155,6 +1225,11 @@ class Portfolio:
         fill_price: float,
         fill_time: pd.Timestamp,
     ) -> Optional[Trade]:
+        spread_aware_pending = (
+            order.type in {"limit", "stop"}
+            and order.reference_price is not None
+            and order.reference_basis is not None
+        )
         trade = Trade(
             symbol=order.symbol,
             side="long" if order.side == "buy" else "short",
@@ -1169,7 +1244,56 @@ class Portfolio:
             broker_ticket=order.broker_ticket,
             strategy=order.strategy,
             magic=order.magic,
+            reference_entry_price=(
+                float(order.reference_price) if spread_aware_pending else None
+            ),
+            reference_basis=(
+                str(order.reference_basis) if spread_aware_pending else None
+            ),
+            spread_aware_pending=spread_aware_pending,
         )
+        if spread_aware_pending:
+            effective_spread = float(order.effective_spread_price or 0.0)
+            if effective_spread <= 0.0:
+                try:
+                    ctx = get_symbol_context(order.symbol)
+                    effective_spread = float(ctx.target_spread or 0.0)
+                except KeyError:
+                    effective_spread = 0.0
+            reference_entry = float(order.reference_price)
+            close_action = "sell" if order.side == "buy" else "buy"
+            if order.stop_points > 0.0:
+                stop_reference = (
+                    reference_entry - float(order.stop_points)
+                    if order.side == "buy"
+                    else reference_entry + float(order.stop_points)
+                )
+                trade.protective_stop_price = (
+                    translate_reference_price(
+                        reference_price=stop_reference,
+                        action=close_action,
+                        spread_price=effective_spread,
+                        reference_basis=str(order.reference_basis),
+                    )
+                    if effective_spread > 0.0
+                    else stop_reference
+                )
+            if order.take_points > 0.0:
+                take_reference = (
+                    reference_entry + float(order.take_points)
+                    if order.side == "buy"
+                    else reference_entry - float(order.take_points)
+                )
+                trade.protective_take_price = (
+                    translate_reference_price(
+                        reference_price=take_reference,
+                        action=close_action,
+                        spread_price=effective_spread,
+                        reference_basis=str(order.reference_basis),
+                    )
+                    if effective_spread > 0.0
+                    else take_reference
+                )
         parent_id = str(getattr(order, "parent_id", "") or "")
         if parent_id.startswith("startup_hydration:"):
             owner = parent_id.split(":", 1)[1]

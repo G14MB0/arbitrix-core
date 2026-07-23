@@ -76,6 +76,12 @@ class Order:
 
     stop_points: float = 0.0
     take_points: float = 0.0
+    # Strategy/reference price and quote-side metadata for spread-aware
+    # pending execution. Legacy orders leave these fields unset.
+    reference_price: Optional[float] = None
+    reference_basis: Optional[str] = None
+    effective_spread_price: float = 0.0
+    spread_embedded_price: float = 0.0
     trail_params: Dict[str, float] = field(default_factory=dict)
     parent_id: Optional[str] = None
 
@@ -109,6 +115,11 @@ class Trade:
     magic: Optional[int] = None
     _last_swap_day: Optional[pd.Timestamp] = None
     expiry: Optional[date] = None
+    reference_entry_price: Optional[float] = None
+    reference_basis: Optional[str] = None
+    protective_stop_price: Optional[float] = None
+    protective_take_price: Optional[float] = None
+    spread_aware_pending: bool = False
 
 
 @dataclass
