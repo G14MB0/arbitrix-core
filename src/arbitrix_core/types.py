@@ -39,6 +39,9 @@ class InstrumentConfig:
     history_expiry: Optional[str] = None
     history_what_to_show: Optional[str] = None
     point_value: Optional[float] = None
+    # Runtime provenance. ``provider`` prevents a resolved current value from
+    # being mistaken for an explicit user override by historical valuation.
+    point_value_source: Optional[str] = None
     contract_size: Optional[float] = None
     tick_size: Optional[float] = None
     # Full bid/ask spread expressed in quote-price units (for example,

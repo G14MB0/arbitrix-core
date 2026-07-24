@@ -349,19 +349,27 @@ def tick_size(symbol: str) -> float:
         if cached is not None:
             return cached
 
-    value = 1.0
+    try:
+        from arbitrix_core.symbols.context import get_symbol_context
+
+        value = float(get_symbol_context(symbol).tick_size)
+    except (KeyError, ImportError):
+        value = None
     inst = get_instrument(symbol)
-    if inst and inst.tick_size:
+    if value is None and inst and inst.tick_size:
         value = float(inst.tick_size)
-    elif _ALLOW_PROVIDER_LOOKUPS and _DATA_PROVIDER is not None:
+    elif value is None and _ALLOW_PROVIDER_LOOKUPS and _DATA_PROVIDER is not None:
         info = _DATA_PROVIDER.get_symbol_info(symbol) or {}
         for key in ("point", "trade_tick_size", "tick_size"):
             candidate = _as_float(info.get(key))
             if candidate and candidate > 0:
                 value = float(candidate)
                 break
-
-    # If no explicit tick size, fall back to 1 "point".
+    if value is None or not math.isfinite(value) or value <= 0:
+        raise RuntimeError(
+            f"Tick size not available for {symbol}. Provide instrument.tick_size "
+            "or provider symbol metadata."
+        )
     with _LOCK:
         _TICK_SIZE_CACHE[cache_key] = value
     return value

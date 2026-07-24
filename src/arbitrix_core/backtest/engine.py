@@ -2080,8 +2080,12 @@ class Backtester:
         return (price - trade.entry_price) if kind == "sl" else (trade.entry_price - price)
 
     def _slippage_points(self, symbol: str, row: pd.Series) -> float:
-        tick = self._tick_size(symbol)
-        base = float(self.cfg.default_slippage_points) * tick
+        configured_points = float(self.cfg.default_slippage_points)
+        base = (
+            configured_points * self._tick_size(symbol)
+            if configured_points != 0.0
+            else 0.0
+        )
         if self.cfg.slippage_atr_multiplier > 0 and "atr" in row and not pd.isna(row["atr"]):
             base += float(row["atr"]) * self.cfg.slippage_atr_multiplier
         return base if base else 0.0
@@ -2198,7 +2202,10 @@ class Backtester:
         spread_points = self._spread_points(row)
         if spread_points <= 0.0:
             return 0.0
-        with costs.using_point_value(symbol, self._account_point_value(symbol, row)):
+        with (
+            costs.using_point_value(symbol, self._account_point_value(symbol, row)),
+            costs.using_tick_size(symbol, self._tick_size(symbol)),
+        ):
             return costs.spread_cost(symbol, spread_points, volume) / 2.0
 
     def _slippage_cost(
@@ -2208,7 +2215,12 @@ class Backtester:
         slippage_points: float,
         volume: float,
     ) -> float:
-        with costs.using_point_value(symbol, self._account_point_value(symbol, row)):
+        if slippage_points <= 0.0 or volume <= 0.0:
+            return 0.0
+        with (
+            costs.using_point_value(symbol, self._account_point_value(symbol, row)),
+            costs.using_tick_size(symbol, self._tick_size(symbol)),
+        ):
             return costs.slippage_cost(symbol, slippage_points, volume)
 
     def _commission_one_side(
@@ -2236,8 +2248,21 @@ class Backtester:
     def _tick_size(self, symbol: str) -> float:
         inst = self.instruments.get(symbol)
         if inst and inst.tick_size:
-            return float(inst.tick_size)
-        return 1.0
+            value = float(inst.tick_size)
+            if math.isfinite(value) and value > 0:
+                return value
+        try:
+            from arbitrix_core.symbols.context import get_symbol_context
+
+            value = float(get_symbol_context(symbol).tick_size)
+        except (KeyError, ImportError):
+            value = float("nan")
+        if math.isfinite(value) and value > 0:
+            return value
+        raise RuntimeError(
+            f"Tick size unavailable for {symbol}; execution metadata must be resolved "
+            "before Backtester construction"
+        )
 
     def _apply_overnight_swap(
         self,

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 from typing import Any, Literal, Mapping, Optional
+
+from .types import InstrumentConfig
 
 
 QuantityUnit = Literal["lot", "base_currency_unit", "share", "contract", "unit"]
@@ -14,6 +16,10 @@ class MissingConversionRate(ValueError):
 
 class MissingAccountCurrency(ValueError):
     """Raised when an online valuation has no provider account currency."""
+
+
+class MissingExecutionMetadata(ValueError):
+    """Raised when execution-critical symbol metadata cannot be resolved."""
 
 
 def _currency(value: str, *, field: str) -> str:
@@ -118,11 +124,200 @@ def configured_point_value(
         if key in overrides:
             raw = overrides[key]
             break
+    if raw is marker and str(getattr(instrument, "point_value_source", "") or "").lower() == "provider":
+        return None
     if raw is marker:
         raw = getattr(instrument, "point_value", None)
     if raw is None:
         return None
     return _positive(raw, field=f"point_value override for {symbol}")
+
+
+def _optional_positive(source: Any, *keys: str, field: str) -> Optional[float]:
+    raw = _read(source, *keys)
+    if raw is None:
+        return None
+    return _positive(raw, field=field)
+
+
+def _provider_info(provider: Any, symbol: str) -> Mapping[str, Any]:
+    getter = getattr(provider, "get_symbol_info", None)
+    if not callable(getter):
+        return {}
+    info = getter(symbol)
+    if info is None:
+        return {}
+    if isinstance(info, Mapping):
+        return info
+    as_dict = getattr(info, "_asdict", None)
+    if callable(as_dict):
+        converted = as_dict()
+        return converted if isinstance(converted, Mapping) else {}
+    try:
+        return vars(info)
+    except TypeError:
+        return {}
+
+
+def resolve_execution_instrument(
+    symbol: str,
+    instrument: InstrumentConfig,
+    *,
+    provider: Any = None,
+    provider_type: str,
+    point_overrides: Optional[Mapping[str, Any]] = None,
+) -> InstrumentConfig:
+    """Resolve broker facts before an engine is allowed to use a symbol.
+
+    User values always win. Missing values are read from the provider. No
+    numeric execution default is manufactured here.
+    """
+
+    info = _provider_info(provider, symbol)
+    provider_name = str(provider_type or "").strip().lower()
+
+    tick_size = _optional_positive(
+        instrument,
+        "tick_size",
+        field=f"{symbol}.tick_size",
+    )
+    if tick_size is None:
+        tick_size = _optional_positive(
+            info,
+            "trade_tick_size",
+            "tick_size",
+            "minTick",
+            "point",
+            field=f"{symbol}.tick_size",
+        )
+
+    contract_size = _optional_positive(
+        instrument,
+        "multiplier",
+        "contract_size",
+        "trading_multiplier",
+        field=f"{symbol}.contract_size",
+    )
+    if contract_size is None:
+        contract_size = _optional_positive(
+            info,
+            "trade_contract_size",
+            "contract_size",
+            "multiplier",
+            "lot_size",
+            field=f"{symbol}.contract_size",
+        )
+
+    point_value = configured_point_value(
+        symbol,
+        instrument=instrument,
+        point_overrides=point_overrides,
+    )
+    point_value_source = "user" if point_value is not None else "provider"
+    if point_value is None:
+        point_value = _optional_positive(
+            info,
+            "point_value",
+            "pointValue",
+            field=f"{symbol}.point_value",
+        )
+    if point_value is None and provider_name in {
+        "mt5",
+        "local-mt5",
+        "local_mt5",
+        "localmt5",
+        "portable-mt5",
+    }:
+        tick_value = _optional_positive(
+            info,
+            "trade_tick_value_profit",
+            "trade_tick_value",
+            "tick_value",
+            field=f"{symbol}.provider_tick_value",
+        )
+        if tick_value is not None and tick_size is not None:
+            point_value = tick_value / tick_size
+    if point_value is None and provider_name in {
+        "ib",
+        "ibkr",
+        "interactive_brokers",
+        "interactive-brokers",
+    }:
+        security_type = str(
+            _read(info, "security_type", "secType")
+            or _read(instrument, "trading_security_type", "security_type")
+            or ""
+        ).upper()
+        if contract_size is not None:
+            point_value = 1.0 if security_type in {"CASH", "STK"} else contract_size
+
+    min_order_size = _optional_positive(
+        instrument,
+        "min_order_size",
+        field=f"{symbol}.min_order_size",
+    )
+    if min_order_size is None:
+        min_order_size = _optional_positive(
+            info,
+            "volume_min",
+            "min_volume",
+            "min_order_size",
+            "minSize",
+            field=f"{symbol}.min_order_size",
+        )
+
+    missing: list[str] = []
+    if tick_size is None:
+        missing.append("tick_size")
+    if contract_size is None:
+        missing.append("contract_size")
+    if point_value is None:
+        missing.append("point_value")
+    if min_order_size is None:
+        missing.append("min_order_size")
+    if missing:
+        raise MissingExecutionMetadata(
+            f"{symbol}: unresolved execution metadata: {', '.join(missing)}"
+        )
+
+    return replace(
+        instrument,
+        multiplier=(
+            float(instrument.multiplier)
+            if instrument.multiplier is not None
+            else float(contract_size)
+        ),
+        contract_size=(
+            float(instrument.contract_size)
+            if instrument.contract_size is not None
+            else float(contract_size)
+        ),
+        tick_size=float(tick_size),
+        point_value=float(point_value),
+        point_value_source=point_value_source,
+        min_order_size=float(min_order_size),
+    )
+
+
+def resolve_execution_instruments(
+    instruments: Mapping[str, InstrumentConfig],
+    *,
+    provider: Any = None,
+    provider_type: str,
+    point_overrides: Optional[Mapping[str, Any]] = None,
+) -> dict[str, InstrumentConfig]:
+    """Resolve every instrument atomically; any incomplete symbol aborts."""
+
+    return {
+        str(symbol): resolve_execution_instrument(
+            str(symbol),
+            instrument,
+            provider=provider,
+            provider_type=provider_type,
+            point_overrides=point_overrides,
+        )
+        for symbol, instrument in instruments.items()
+    }
 
 
 def current_point_value_from_metadata(
@@ -260,9 +455,12 @@ __all__ = [
     "ContractSpec",
     "MissingAccountCurrency",
     "MissingConversionRate",
+    "MissingExecutionMetadata",
     "QuantityUnit",
     "account_point_value",
     "configured_point_value",
     "contract_spec_from_metadata",
     "current_point_value_from_metadata",
+    "resolve_execution_instrument",
+    "resolve_execution_instruments",
 ]

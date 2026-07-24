@@ -117,11 +117,10 @@ class Portfolio:
 
         import arbitrix_core.costs as costs
 
-        try:
-            value = float(costs.get_point_value(symbol))
-        except Exception:
-            value = 1.0
-        return value if math.isfinite(value) and value > 0 else 1.0
+        value = float(costs.get_point_value(symbol))
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"Invalid account point value for {symbol}: {value!r}")
+        return value
 
     @property
     def equity(self) -> float:
@@ -1184,11 +1183,9 @@ class Portfolio:
         # non-FUT, multiplier == 1.0, so behavior is unchanged. See
         # docs/symbols/futures.md for the rationale.
         def _mult(sym: str) -> float:
-            try:
-                from arbitrix_core.symbols.context import get_symbol_context
-                return float(get_symbol_context(sym).multiplier)
-            except (KeyError, ImportError):
-                return 1.0
+            from arbitrix_core.symbols.context import get_symbol_context
+
+            return float(get_symbol_context(sym).multiplier)
         mult = _mult(symbol)
         open_notional = sum(trade.entry_price * trade.volume * mult for trade in open_trades)
         closed_notional = sum(trade.entry_price * trade.volume * mult for trade in closed_trades)
