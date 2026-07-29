@@ -3,8 +3,10 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
+import logging
+import math
 import threading
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import pandas as pd
 
@@ -15,7 +17,12 @@ from arbitrix_core.margin import (
     get_margin_params,
     resolve_margin_model,
 )
+from arbitrix_core.symbols.context import get_symbol_context
+from arbitrix_core.symbols.spread_pricing import translate_reference_price
 from arbitrix_core.trading import Order, Trade
+
+
+logger = logging.getLogger(__name__)
 
 
 def _margin_model_for_symbol(symbol: str):
@@ -64,7 +71,13 @@ class PortfolioSnapshot:
 class Portfolio:
     """Shared portfolio view used by backtest and live runtimes."""
 
-    def __init__(self, *, initial_equity: float = 0.0, equity_source: str = "engine") -> None:
+    def __init__(
+        self,
+        *,
+        initial_equity: float = 0.0,
+        equity_source: str = "engine",
+        point_value_resolver: Optional[Callable[[str, float], float]] = None,
+    ) -> None:
         self._equity = float(initial_equity)
         self._gross_equity = float(initial_equity)
         self._equity_marked = float(initial_equity)
@@ -80,6 +93,9 @@ class Portfolio:
         self._version = 0
         self._exposure_cache: Dict[Tuple[str, Optional[str], Optional[pd.Timestamp], int], Dict[str, Any]] = {}
         self._last_prices: Dict[str, float] = {}
+        self._point_value_resolver = point_value_resolver
+        self._unrealized_pnl_by_trade: Dict[str, float] = {}
+        self._valuation_warning_trade_ids: set[str] = set()
         # Portfolio-level margin cap, set by the engine at boot from
         # :attr:`BTConfig.max_margin_utilization` (Sub-spec 2 / Task 20).
         # Default 1.0 = no cap beyond per-symbol margin_available check.
@@ -88,6 +104,23 @@ class Portfolio:
     def _bump(self) -> None:
         self._version += 1
         self._exposure_cache.clear()
+
+    def resolve_point_value(self, symbol: str, price: float) -> float:
+        resolver = self._point_value_resolver
+        if resolver is not None:
+            value = float(resolver(symbol, float(price)))
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(
+                    f"Invalid account point value for {symbol}: {value!r}"
+                )
+            return value
+
+        import arbitrix_core.costs as costs
+
+        value = float(costs.get_point_value(symbol))
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"Invalid account point value for {symbol}: {value!r}")
+        return value
 
     @property
     def equity(self) -> float:
@@ -497,6 +530,63 @@ class Portfolio:
                 return True
         return False
 
+    def sync_trade_from_broker(
+        self,
+        trade_id: str,
+        *,
+        volume: Optional[float] = None,
+        entry_price: Optional[float] = None,
+        stop_loss: Optional[float] = None,
+        take_profit: Optional[float] = None,
+        current_price: Optional[float] = None,
+        sync_stop_loss: bool = False,
+        sync_take_profit: bool = False,
+    ) -> Dict[str, tuple[float, float]]:
+        """Apply authoritative broker position fields to one open trade."""
+        changes: Dict[str, tuple[float, float]] = {}
+        with self._lock:
+            market_updated = False
+            trade = next((item for item in self._open_trades if item.id == trade_id), None)
+            if trade is None:
+                return changes
+            if volume is not None and math.isfinite(float(volume)) and float(volume) > 0:
+                new_volume = float(volume)
+                if not math.isclose(float(trade.volume), new_volume, rel_tol=0.0, abs_tol=1e-12):
+                    changes["volume"] = (float(trade.volume), new_volume)
+                    trade.volume = new_volume
+                    for order in self._orders:
+                        if order.id == trade.order_id:
+                            order.volume = new_volume
+                            break
+            if entry_price is not None and math.isfinite(float(entry_price)) and float(entry_price) > 0:
+                new_entry = float(entry_price)
+                if not math.isclose(float(trade.entry_price), new_entry, rel_tol=0.0, abs_tol=1e-12):
+                    changes["entry_price"] = (float(trade.entry_price), new_entry)
+                    trade.entry_price = new_entry
+            if sync_stop_loss:
+                new_stop_points = 0.0
+                if stop_loss is not None and math.isfinite(float(stop_loss)) and float(stop_loss) > 0:
+                    new_stop_points = self._points_from_price(trade, float(stop_loss), kind="sl")
+                if not math.isclose(float(trade.stop_points or 0.0), new_stop_points, rel_tol=0.0, abs_tol=1e-12):
+                    changes["stop_points"] = (float(trade.stop_points or 0.0), new_stop_points)
+                    trade.stop_points = new_stop_points
+            if sync_take_profit:
+                new_take_points = 0.0
+                if take_profit is not None and math.isfinite(float(take_profit)) and float(take_profit) > 0:
+                    new_take_points = self._points_from_price(trade, float(take_profit), kind="tp")
+                if not math.isclose(float(trade.take_points or 0.0), new_take_points, rel_tol=0.0, abs_tol=1e-12):
+                    changes["take_points"] = (float(trade.take_points or 0.0), new_take_points)
+                    trade.take_points = new_take_points
+            if current_price is not None and math.isfinite(float(current_price)) and float(current_price) > 0:
+                new_market_price = float(current_price)
+                previous_market_price = self._last_prices.get(trade.symbol)
+                market_updated = previous_market_price != new_market_price
+                self._last_prices[trade.symbol] = new_market_price
+            if changes or market_updated:
+                self._recalc_mark_to_market()
+                self._bump()
+        return changes
+
     def update_order_stops(
         self,
         order_id: str,
@@ -541,14 +631,32 @@ class Portfolio:
                 return True
         return False
 
-    def close_trade(self, trade: Trade, *, exit_price: float, exit_time: pd.Timestamp, reason: str) -> None:
+    def close_trade(
+        self,
+        trade: Trade,
+        *,
+        exit_price: float,
+        exit_time: pd.Timestamp,
+        reason: str,
+        gross_pnl_override: Optional[float] = None,
+    ) -> None:
         with self._lock:
+            pnl = (
+                float(gross_pnl_override)
+                if gross_pnl_override is not None
+                else self._calc_trade_pnl(trade, float(exit_price))
+            )
             if trade in self._open_trades:
                 self._open_trades.remove(trade)
             trade.exit_time = exit_time
             trade.exit_price = float(exit_price)
             trade.notes[f"exit_{reason}"] = 1.0
-            pnl = self._calc_trade_pnl(trade, float(exit_price))
+            if reason == "stop_loss":
+                trade.notes["exit_stop"] = 1.0
+                trade.notes["exit_take"] = 0.0
+            elif reason == "take_profit":
+                trade.notes["exit_stop"] = 0.0
+                trade.notes["exit_take"] = 1.0
             trade.gross_pnl = pnl
             trade.pnl = pnl
             trade.net_pnl = pnl
@@ -566,15 +674,29 @@ class Portfolio:
         exit_time: pd.Timestamp,
         reason: str = "signal_exit",
         close_volume: Optional[float] = None,
+        gross_pnl_override: Optional[float] = None,
     ) -> Optional[Trade]:
         with self._lock:
             trade = self.get_trade_by_id(trade_id)
             if trade is None:
                 return None
             if close_volume is None or close_volume >= trade.volume:
-                self.close_trade(trade, exit_price=exit_price, exit_time=exit_time, reason=reason)
+                self.close_trade(
+                    trade,
+                    exit_price=exit_price,
+                    exit_time=exit_time,
+                    reason=reason,
+                    gross_pnl_override=gross_pnl_override,
+                )
                 return trade
-            return self._partial_close_trade(trade, close_volume, exit_price, exit_time, reason)
+            return self._partial_close_trade(
+                trade,
+                close_volume,
+                exit_price,
+                exit_time,
+                reason,
+                gross_pnl_override=gross_pnl_override,
+            )
 
     def apply_trade_outcome_overrides(
         self,
@@ -710,6 +832,17 @@ class Portfolio:
                 self._closed_trades = [trade for trade in self._closed_trades if not _is_synthetic_trade(trade)]
                 self._equity -= closed_pnl
                 self._gross_equity -= closed_gross
+            # Entry costs are booked immediately when a synthetic trade opens.
+            # Closing and the PnL rollback above do not reverse that original
+            # debit. Restore it for every removed synthetic trade exactly once.
+            removed_trade_cost_effect = sum(
+                float(getattr(trade, "commission_paid", 0.0) or 0.0)
+                + float(getattr(trade, "spread_cost", 0.0) or 0.0)
+                + float(getattr(trade, "slippage_cost", 0.0) or 0.0)
+                - float(getattr(trade, "swap_pnl", 0.0) or 0.0)
+                for trade in (*removed_open, *removed_closed)
+            )
+            self._equity += removed_trade_cost_effect
             if removed_pending:
                 self._pending_orders = [order for order in self._pending_orders if not _is_synthetic_order(order)]
             if removed_orders:
@@ -754,6 +887,7 @@ class Portfolio:
         timestamp: pd.Timestamp,
         *,
         check_stops: bool = False,
+        process_pending: bool = True,
         stop_priority: str = "sl_first",
     ) -> None:
         with self._lock:
@@ -764,7 +898,8 @@ class Portfolio:
             self._recalc_mark_to_market()
         if check_stops:
             self._check_open_trade_stops(symbol, row, timestamp, stop_priority=stop_priority)
-        self.process_pending_orders(symbol, row, timestamp)
+        if process_pending:
+            self.process_pending_orders(symbol, row, timestamp)
 
     def _check_open_trade_stops(
         self,
@@ -800,7 +935,43 @@ class Portfolio:
                 sl_hit = False
                 tp_hit = False
 
-                if trade.side == "long":
+                if trade.spread_aware_pending:
+                    sl_price = trade.protective_stop_price
+                    tp_price = trade.protective_take_price
+                    quote_low = low
+                    quote_high = high
+                    try:
+                        ctx = get_symbol_context(symbol)
+                        spread_points = float(row.get("spread", 0.0) or 0.0)
+                        spread_price = max(spread_points, 0.0) * float(ctx.tick_size)
+                        if spread_price <= 0.0 and ctx.target_spread is not None:
+                            spread_price = float(ctx.target_spread)
+                        if spread_price > 0.0:
+                            close_action = (
+                                "sell" if trade.side == "long" else "buy"
+                            )
+                            quote_low = translate_reference_price(
+                                reference_price=low,
+                                action=close_action,
+                                spread_price=spread_price,
+                                reference_basis=str(trade.reference_basis),
+                            )
+                            quote_high = translate_reference_price(
+                                reference_price=high,
+                                action=close_action,
+                                spread_price=spread_price,
+                                reference_basis=str(trade.reference_basis),
+                            )
+                    except (KeyError, TypeError, ValueError):
+                        quote_low = low
+                        quote_high = high
+                    if trade.side == "long":
+                        sl_hit = sl_price is not None and quote_low <= sl_price
+                        tp_hit = tp_price is not None and quote_high >= tp_price
+                    else:
+                        sl_hit = sl_price is not None and quote_high >= sl_price
+                        tp_hit = tp_price is not None and quote_low <= tp_price
+                elif trade.side == "long":
                     if stop_points > 0.0:
                         sl_price = float(trade.entry_price) - stop_points
                         sl_hit = low <= sl_price
@@ -848,28 +1019,60 @@ class Portfolio:
                     updated = True
                     continue
                 created_at = _normalize_ts(order.created_at)
-                if order.type != "market" and created_at is not None and created_at >= ts:
+                if order.type != "market" and created_at is not None and created_at > ts:
                     order.status = "working"
                     still_pending.append(order)
                     continue
                 price = order.price if order.price is not None else close
+                order_low = low
+                order_high = high
+                spread_price = 0.0
+                if order.reference_basis is not None:
+                    try:
+                        ctx = get_symbol_context(symbol)
+                        spread_points = float(row.get("spread", 0.0) or 0.0)
+                        spread_price = max(spread_points, 0.0) * float(ctx.tick_size)
+                        if spread_price <= 0.0 and ctx.target_spread is not None:
+                            spread_price = float(ctx.target_spread)
+                        if spread_price > 0.0:
+                            order_low = translate_reference_price(
+                                reference_price=low,
+                                action=order.side,
+                                spread_price=spread_price,
+                                reference_basis=order.reference_basis,
+                            )
+                            order_high = translate_reference_price(
+                                reference_price=high,
+                                action=order.side,
+                                spread_price=spread_price,
+                                reference_basis=order.reference_basis,
+                            )
+                    except (KeyError, TypeError, ValueError):
+                        order_low = low
+                        order_high = high
                 filled = False
                 fill_price = price
                 if order.type == "market":
                     filled = True
                     fill_price = close
                 elif order.type == "limit":
-                    if order.side == "buy" and low <= price:
+                    if order.side == "buy" and order_low <= price:
                         filled = True
-                    elif order.side == "sell" and high >= price:
+                    elif order.side == "sell" and order_high >= price:
                         filled = True
                 elif order.type == "stop":
-                    if order.side == "buy" and high >= price:
+                    if order.side == "buy" and order_high >= price:
                         filled = True
-                    elif order.side == "sell" and low <= price:
+                    elif order.side == "sell" and order_low <= price:
                         filled = True
                 if filled:
                     order.status = "filled"
+                    if (
+                        order.reference_basis is not None
+                        and order.effective_spread_price <= 0.0
+                        and spread_price > 0.0
+                    ):
+                        order.effective_spread_price = float(spread_price)
                     trade = self._open_trade_from_order(order, fill_price=fill_price, fill_time=ts)
                     if trade is not None:
                         self._open_trades.append(trade)
@@ -980,11 +1183,9 @@ class Portfolio:
         # non-FUT, multiplier == 1.0, so behavior is unchanged. See
         # docs/symbols/futures.md for the rationale.
         def _mult(sym: str) -> float:
-            try:
-                from arbitrix_core.symbols.context import get_symbol_context
-                return float(get_symbol_context(sym).multiplier)
-            except (KeyError, ImportError):
-                return 1.0
+            from arbitrix_core.symbols.context import get_symbol_context
+
+            return float(get_symbol_context(sym).multiplier)
         mult = _mult(symbol)
         open_notional = sum(trade.entry_price * trade.volume * mult for trade in open_trades)
         closed_notional = sum(trade.entry_price * trade.volume * mult for trade in closed_trades)
@@ -1078,10 +1279,17 @@ class Portfolio:
         fill_price: float,
         fill_time: pd.Timestamp,
     ) -> Optional[Trade]:
+        spread_aware_pending = (
+            order.type in {"limit", "stop"}
+            and order.reference_price is not None
+            and order.reference_basis is not None
+        )
         trade = Trade(
             symbol=order.symbol,
             side="long" if order.side == "buy" else "short",
-            entry_time=order.created_at or fill_time,
+            # Order creation and execution are different events. Using
+            # created_at here backdates pending fills and breaks broker truth.
+            entry_time=fill_time,
             entry_price=float(fill_price),
             volume=float(order.volume),
             stop_points=float(order.stop_points),
@@ -1090,7 +1298,56 @@ class Portfolio:
             broker_ticket=order.broker_ticket,
             strategy=order.strategy,
             magic=order.magic,
+            reference_entry_price=(
+                float(order.reference_price) if spread_aware_pending else None
+            ),
+            reference_basis=(
+                str(order.reference_basis) if spread_aware_pending else None
+            ),
+            spread_aware_pending=spread_aware_pending,
         )
+        if spread_aware_pending:
+            effective_spread = float(order.effective_spread_price or 0.0)
+            if effective_spread <= 0.0:
+                try:
+                    ctx = get_symbol_context(order.symbol)
+                    effective_spread = float(ctx.target_spread or 0.0)
+                except KeyError:
+                    effective_spread = 0.0
+            reference_entry = float(order.reference_price)
+            close_action = "sell" if order.side == "buy" else "buy"
+            if order.stop_points > 0.0:
+                stop_reference = (
+                    reference_entry - float(order.stop_points)
+                    if order.side == "buy"
+                    else reference_entry + float(order.stop_points)
+                )
+                trade.protective_stop_price = (
+                    translate_reference_price(
+                        reference_price=stop_reference,
+                        action=close_action,
+                        spread_price=effective_spread,
+                        reference_basis=str(order.reference_basis),
+                    )
+                    if effective_spread > 0.0
+                    else stop_reference
+                )
+            if order.take_points > 0.0:
+                take_reference = (
+                    reference_entry + float(order.take_points)
+                    if order.side == "buy"
+                    else reference_entry - float(order.take_points)
+                )
+                trade.protective_take_price = (
+                    translate_reference_price(
+                        reference_price=take_reference,
+                        action=close_action,
+                        spread_price=effective_spread,
+                        reference_basis=str(order.reference_basis),
+                    )
+                    if effective_spread > 0.0
+                    else take_reference
+                )
         parent_id = str(getattr(order, "parent_id", "") or "")
         if parent_id.startswith("startup_hydration:"):
             owner = parent_id.split(":", 1)[1]
@@ -1100,25 +1357,13 @@ class Portfolio:
         return trade
 
     def _calc_trade_pnl(self, trade: Trade, exit_price: float) -> float:
-        import arbitrix_core.costs as costs
-        try:
-            point_value = costs.get_point_value(trade.symbol)
-        except Exception:
-            point_value = 1.0
-        if not point_value:
-            point_value = 1.0
+        point_value = self.resolve_point_value(trade.symbol, exit_price)
         if trade.side == "long":
             return (exit_price - trade.entry_price) * point_value * trade.volume
         return (trade.entry_price - exit_price) * point_value * trade.volume
 
     def _calc_trade_pnl_volume(self, trade: Trade, exit_price: float, volume: float) -> float:
-        import arbitrix_core.costs as costs
-        try:
-            point_value = costs.get_point_value(trade.symbol)
-        except Exception:
-            point_value = 1.0
-        if not point_value:
-            point_value = 1.0
+        point_value = self.resolve_point_value(trade.symbol, exit_price)
         if trade.side == "long":
             return (exit_price - trade.entry_price) * point_value * volume
         return (trade.entry_price - exit_price) * point_value * volume
@@ -1130,6 +1375,7 @@ class Portfolio:
         exit_price: float,
         exit_time: pd.Timestamp,
         reason: str,
+        gross_pnl_override: Optional[float] = None,
     ) -> Optional[Trade]:
         if volume <= 0:
             return None
@@ -1158,7 +1404,11 @@ class Portfolio:
         closed_trade.exit_price = float(exit_price)
         closed_trade.notes.update(dict(getattr(trade, "notes", {}) or {}))
         closed_trade.notes[f"exit_{reason}"] = 1.0
-        closed_trade.gross_pnl = self._calc_trade_pnl_volume(trade, float(exit_price), volume)
+        closed_trade.gross_pnl = (
+            float(gross_pnl_override)
+            if gross_pnl_override is not None
+            else self._calc_trade_pnl_volume(trade, float(exit_price), volume)
+        )
         total_costs = closed_trade.commission_paid + closed_trade.spread_cost + closed_trade.slippage_cost
         closed_trade.pnl = closed_trade.gross_pnl - total_costs
         closed_trade.net_pnl = closed_trade.gross_pnl - total_costs + closed_trade.swap_pnl
@@ -1187,10 +1437,37 @@ class Portfolio:
         return (price - trade.entry_price) if kind == "sl" else (trade.entry_price - price)
 
     def _recalc_mark_to_market(self) -> None:
-        unrealized = 0.0
+        open_trade_ids = {str(trade.id) for trade in self._open_trades}
+        self._unrealized_pnl_by_trade = {
+            trade_id: pnl
+            for trade_id, pnl in self._unrealized_pnl_by_trade.items()
+            if trade_id in open_trade_ids
+        }
+        self._valuation_warning_trade_ids.intersection_update(open_trade_ids)
         for trade in self._open_trades:
             last_price = self._last_prices.get(trade.symbol)
             if last_price is None:
                 continue
-            unrealized += self._calc_trade_pnl(trade, last_price)
-        self._equity_marked = self._equity + unrealized
+            trade_id = str(trade.id)
+            try:
+                self._unrealized_pnl_by_trade[trade_id] = self._calc_trade_pnl(
+                    trade,
+                    last_price,
+                )
+            except Exception:
+                if self._point_value_resolver is None:
+                    raise
+                if trade_id not in self._valuation_warning_trade_ids:
+                    logger.warning(
+                        "Live mark-to-market valuation unavailable for %s/%s; "
+                        "preserving the last calculated unrealized PnL",
+                        trade.symbol,
+                        trade_id,
+                        exc_info=True,
+                    )
+                    self._valuation_warning_trade_ids.add(trade_id)
+            else:
+                self._valuation_warning_trade_ids.discard(trade_id)
+        self._equity_marked = self._equity + sum(
+            self._unrealized_pnl_by_trade.values()
+        )

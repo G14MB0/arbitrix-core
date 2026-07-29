@@ -19,6 +19,11 @@ import arbitrix_core.costs as costs
 from arbitrix_core.backtest.bar_view import BarViewSource
 from arbitrix_core.margin import MarginCallEvent
 from arbitrix_core.portfolio import Portfolio
+from arbitrix_core.symbols.spread_pricing import (
+    resolve_effective_spread,
+    translate_reference_price,
+    validate_spread_price,
+)
 from arbitrix_core.strategies.base import BaseStrategy, invoke_strategy_on_bar
 from arbitrix_core.trading import Order, Signal, Trade, Position
 from arbitrix_core.types import InstrumentConfig
@@ -201,7 +206,7 @@ class BTConfig:
     apply_spread_cost: bool = True
     apply_swap_cost: bool = True
     apply_stop_take: bool = True
-    market_fill_price: str = "close"  # "open" or "close"
+    market_fill_price: str = "close"  # "close" or "next_open"; "open" is normalized to "next_open"
     exit_fill_price: str = "close"  # "open" or "close"
     intra_bar_model: str = "sl_first"  # "sl_first", "tp_first", "none"
     trailing_mode: str = "none"  # placeholder for future engine modes
@@ -227,15 +232,43 @@ class BTResult:
 
 
 class Backtester:
-    def __init__(self, cfg: BTConfig, instruments: Optional[Dict[str, InstrumentConfig]] = None):
+    def __init__(
+        self,
+        cfg: BTConfig,
+        instruments: Optional[Dict[str, InstrumentConfig]] = None,
+        *,
+        reference_basis_by_symbol: Optional[Dict[str, str]] = None,
+    ):
         self.cfg = cfg
+        self.cfg.market_fill_price = self._normalize_market_fill_price(cfg.market_fill_price)
+        self.cfg.exit_fill_price = self._normalize_exit_fill_price(cfg.exit_fill_price)
         self.instruments = instruments or {}
+        self.reference_basis_by_symbol = {
+            str(symbol).lower(): str(basis).strip().upper()
+            for symbol, basis in (reference_basis_by_symbol or {}).items()
+        }
         self._order_id = 0
         costs.set_commission_per_lot(cfg.commission_per_lot)
 
     def _next_order_id(self) -> int:
         self._order_id += 1
         return self._order_id
+
+    @staticmethod
+    def _normalize_market_fill_price(value: Any) -> str:
+        mode = str(value or "").strip().lower()
+        if mode == "open":
+            return "next_open"
+        if mode in {"close", "next_open"}:
+            return mode
+        raise ValueError("BTConfig.market_fill_price must be 'close', 'next_open', or 'open'.")
+
+    @staticmethod
+    def _normalize_exit_fill_price(value: Any) -> str:
+        mode = str(value or "").strip().lower()
+        if mode in {"close", "open"}:
+            return mode
+        raise ValueError("BTConfig.exit_fill_price must be 'close' or 'open'.")
 
     @staticmethod
     def _preserve_prepared_columns(
@@ -390,7 +423,11 @@ class Backtester:
             raise ValueError("Strategy.prepare() must return a DataFrame.")
         if not rolling_prepare:
             section_started = time.monotonic() if runtime_breakdown_enabled else 0.0
-            prepared = self._preserve_prepared_columns(df, prepared, columns=("spread", "__regime_output__"))
+            prepared = self._preserve_prepared_columns(
+                df,
+                prepared,
+                columns=("spread", "__regime_output__", "__account_point_value__"),
+            )
             if runtime_breakdown_enabled:
                 prepare_breakdown["preserve_columns_s"] += max(
                     0.0,
@@ -496,6 +533,7 @@ class Backtester:
         equity = float(initial_equity)
         gross_equity = float(initial_equity)
         symbol = strategy.symbol or "SYMBOL"
+        self._validate_target_spread_at_startup(symbol, prepared)
         open_trades: List[Trade] = []
         closed_trades: List[Trade] = []
         margin_call_events: List[MarginCallEvent] = []
@@ -591,7 +629,7 @@ class Backtester:
                 current_prepared = self._preserve_prepared_columns(
                     window,
                     current_prepared,
-                    columns=("spread", "__regime_output__"),
+                    columns=("spread", "__regime_output__", "__account_point_value__"),
                 )
                 if runtime_breakdown_enabled:
                     prepare_breakdown["preserve_columns_s"] += max(
@@ -617,11 +655,27 @@ class Backtester:
             if runtime_breakdown_enabled:
                 loop_breakdown["control_s"] += max(0.0, time.monotonic() - control_started)
 
+            working_orders = self._expire_orders_before_bar(working_orders, ts)
+            (
+                equity,
+                open_trades,
+                working_orders,
+                newly_filled_at_open,
+                newly_filled_orders_at_open,
+            ) = self._fill_ready_market_orders_at_bar_open(
+                symbol=symbol,
+                row=row,
+                ts=ts,
+                open_trades=open_trades,
+                working_orders=working_orders,
+                equity=equity,
+            )
+
             # Apply swap logic before evaluating stops/signals.
             section_started = time.monotonic() if runtime_breakdown_enabled else 0.0
             pre_sl_trades: List[Trade] = []
             for trade in open_trades:
-                swap_delta = self._apply_overnight_swap(symbol, trade, day, swap_override)
+                swap_delta = self._apply_overnight_swap(symbol, trade, row, day, swap_override)
                 if swap_delta:
                     equity += swap_delta
                 pre_sl_trades.append(trade)
@@ -688,6 +742,7 @@ class Backtester:
             if runtime_breakdown_enabled:
                 loop_breakdown["on_bar_s"] += max(0.0, time.monotonic() - section_started)
             section_started = time.monotonic() if runtime_breakdown_enabled else 0.0
+            order_count_before_signals = len(all_orders)
             equity, gross_equity, open_trades, working_orders = self._apply_bar_signals(
                 strategy=strategy,
                 signals=bar_signals,
@@ -703,18 +758,13 @@ class Backtester:
                 gross_equity=gross_equity,
                 signal_intents=signal_intents,
             )
+            newly_created_orders = list(all_orders[order_count_before_signals:])
             if runtime_breakdown_enabled:
                 loop_breakdown["apply_signals_s"] += max(0.0, time.monotonic() - section_started)
 
             # Drop expired orders
             section_started = time.monotonic() if runtime_breakdown_enabled else 0.0
-            still_working: List[Order] = []
-            for order in working_orders:
-                if order.valid_until is not None and ts > order.valid_until:
-                    order.status = "expired"
-                    continue
-                still_working.append(order)
-            working_orders = still_working
+            working_orders = self._expire_orders_before_bar(working_orders, ts)
             if runtime_breakdown_enabled:
                 loop_breakdown["expire_orders_s"] += max(0.0, time.monotonic() - section_started)
 
@@ -728,12 +778,12 @@ class Backtester:
             newly_filled_orders: List[Order] = []
             remaining_orders: List[Order] = []
             for order in working_orders:
-                created_at = pd.Timestamp(order.created_at) if order.created_at is not None else None
-                if created_at is not None and created_at.tzinfo is None:
-                    created_at = created_at.tz_localize("UTC")
-                elif created_at is not None:
-                    created_at = created_at.tz_convert("UTC")
-                if order.type != "market" and created_at is not None and created_at > ts:
+                created_at = self._order_created_at(order)
+                if (
+                    (order.type != "market" or self.cfg.market_fill_price == "next_open")
+                    and created_at is not None
+                    and created_at > ts
+                ):
                     order.status = "working"
                     remaining_orders.append(order)
                     continue
@@ -741,12 +791,18 @@ class Backtester:
                 if filled is None:
                     remaining_orders.append(order)
                     continue
-                fill_time = created_at if order.type == "market" and created_at is not None else ts
+                if order.type == "market" and created_at is not None:
+                    if self.cfg.market_fill_price == "close":
+                        fill_time = created_at
+                    else:
+                        fill_time = created_at if created_at == ts else ts
+                else:
+                    fill_time = ts
                 trade, equity = self._open_trade_from_order(symbol, order, filled, row, fill_time, equity)
                 if trade:
                     newly_filled.append(trade)
                     newly_filled_orders.append(order)
-            working_orders = remaining_orders
+            working_orders = self._expire_orders_after_bar(remaining_orders, ts)
             open_trades.extend(newly_filled)
             if runtime_breakdown_enabled:
                 loop_breakdown["fill_orders_s"] += max(0.0, time.monotonic() - section_started)
@@ -782,13 +838,14 @@ class Backtester:
                         "equity": float(equity),
                         "gross_equity": float(gross_equity),
                         "bar_signals": list(bar_signals) if bar_signals else [],
-                        "newly_filled": list(newly_filled),
+                        "newly_created_orders": newly_created_orders,
+                        "newly_filled": list(newly_filled_at_open) + list(newly_filled),
                         # ARB-129 iter-5: parallel to newly_filled, exposes the
                         # source Order for each filled Trade so observers can
                         # read Order.type / Order.price. Backwards-compatible:
                         # existing observers that ignore unknown keys are
                         # unaffected.
-                        "newly_filled_orders": list(newly_filled_orders),
+                        "newly_filled_orders": list(newly_filled_orders_at_open) + list(newly_filled_orders),
                     }
                 )
 
@@ -821,6 +878,11 @@ class Backtester:
             last_ts = prepared.index[-1].tz_localize("UTC") if prepared.index[-1].tzinfo is None else prepared.index[-1].tz_convert("UTC")
             last_row = prepared.iloc[-1]
         day = last_ts.normalize()
+        working_orders = self._expire_orders_after_bar(
+            working_orders,
+            last_ts,
+            expire_unfilled_market=True,
+        )
         section_started = time.monotonic() if runtime_breakdown_enabled else 0.0
         if early_stopped:
             for trade in open_trades:
@@ -833,7 +895,7 @@ class Backtester:
         else:
             # Force close remaining trades at last bar
             for trade in list(open_trades):
-                swap_delta = self._apply_overnight_swap(symbol, trade, day, swap_override)
+                swap_delta = self._apply_overnight_swap(symbol, trade, last_row, day, swap_override)
                 if swap_delta:
                     equity += swap_delta
                 equity, gross_equity, _ = self._close_trade(
@@ -1104,10 +1166,104 @@ class Backtester:
             margin_call_events=margin_call_events,
         )
 
+    @staticmethod
+    def _order_created_at(order: Order) -> Optional[pd.Timestamp]:
+        if order.created_at is None:
+            return None
+        created_at = pd.Timestamp(order.created_at)
+        if created_at.tzinfo is None:
+            return created_at.tz_localize("UTC")
+        return created_at.tz_convert("UTC")
+
+    @staticmethod
+    def _order_valid_until(order: Order) -> Optional[pd.Timestamp]:
+        if order.valid_until is None:
+            return None
+        valid_until = pd.Timestamp(order.valid_until)
+        if valid_until.tzinfo is None:
+            return valid_until.tz_localize("UTC")
+        return valid_until.tz_convert("UTC")
+
+    def _expire_orders_before_bar(self, orders: List[Order], ts: pd.Timestamp) -> List[Order]:
+        current_ts = self._normalize_ts(ts)
+        if current_ts is None:
+            return orders
+        still_working: List[Order] = []
+        for order in orders:
+            valid_until = self._order_valid_until(order)
+            if valid_until is not None and current_ts > valid_until:
+                order.status = "expired"
+                continue
+            still_working.append(order)
+        return still_working
+
+    def _expire_orders_after_bar(
+        self,
+        orders: List[Order],
+        ts: pd.Timestamp,
+        *,
+        expire_unfilled_market: bool = False,
+    ) -> List[Order]:
+        current_ts = self._normalize_ts(ts)
+        if current_ts is None:
+            return orders
+        still_working: List[Order] = []
+        for order in orders:
+            valid_until = self._order_valid_until(order)
+            if valid_until is not None and current_ts >= valid_until:
+                order.status = "expired"
+                continue
+            if expire_unfilled_market and order.type == "market":
+                order.status = "expired"
+                continue
+            still_working.append(order)
+        return still_working
+
+    def _fill_ready_market_orders_at_bar_open(
+        self,
+        *,
+        symbol: str,
+        row: pd.Series,
+        ts: pd.Timestamp,
+        open_trades: List[Trade],
+        working_orders: List[Order],
+        equity: float,
+    ) -> tuple[float, List[Trade], List[Order], List[Trade], List[Order]]:
+        if self.cfg.market_fill_price != "next_open" or not working_orders:
+            return equity, open_trades, working_orders, [], []
+
+        current_ts = self._normalize_ts(ts)
+        if current_ts is None:
+            return equity, open_trades, working_orders, [], []
+
+        remaining_orders: List[Order] = []
+        newly_filled: List[Trade] = []
+        newly_filled_orders: List[Order] = []
+        for order in working_orders:
+            if order.type != "market":
+                remaining_orders.append(order)
+                continue
+            created_at = self._order_created_at(order)
+            if created_at is not None and created_at > current_ts:
+                order.status = "working"
+                remaining_orders.append(order)
+                continue
+            filled = self._try_fill_order(order, row)
+            if filled is None:
+                remaining_orders.append(order)
+                continue
+            fill_time = created_at if created_at is not None and created_at == current_ts else current_ts
+            trade, equity = self._open_trade_from_order(symbol, order, filled, row, fill_time, equity)
+            if trade:
+                open_trades.append(trade)
+                newly_filled.append(trade)
+                newly_filled_orders.append(order)
+        return equity, open_trades, remaining_orders, newly_filled, newly_filled_orders
+
     def _unrealized_pnl(self, symbol: str, trades: List[Trade], row: pd.Series) -> float:
         if not trades:
             return 0.0
-        pv = costs.get_point_value(symbol)
+        pv = self._account_point_value(symbol, row)
         if pv == 0:
             return 0.0
         pnl = 0.0
@@ -1131,7 +1287,7 @@ class Backtester:
         if stop_points <= 0:
             return None
         take_points = float(strategy.take_distance_points(row))
-        point_value = costs.get_point_value(symbol)
+        point_value = self._account_point_value(symbol, row)
         if point_value <= 0:
             return None
 
@@ -1146,7 +1302,14 @@ class Backtester:
         # below min_order_size. Non-FUT keeps legacy round-to-2 behavior.
         # See docs/risk/position-sizing.md for the rule.
         if volume is None:
-            risk_dollars = equity * risk_perc * signal.risk_multiplier
+            try:
+                risk_multiplier = float(signal.risk_multiplier)
+            except (TypeError, ValueError):
+                return None
+            if not math.isfinite(risk_multiplier):
+                return None
+            risk_multiplier = min(max(risk_multiplier, 0.0), 1.0)
+            risk_dollars = equity * risk_perc * risk_multiplier
             raw = risk_dollars / (point_value * stop_points)
             try:
                 from arbitrix_core.symbols.context import get_symbol_context
@@ -1157,17 +1320,44 @@ class Backtester:
                         return None
                     volume = float(floored)
                 else:
-                    volume = round(raw, 2)
+                    volume = math.floor((max(raw, 0.0) + 1e-12) * 100.0) / 100.0
             except (KeyError, ImportError):
-                volume = round(raw, 2)
+                volume = math.floor((max(raw, 0.0) + 1e-12) * 100.0) / 100.0
         if volume <= 0:
             return None
 
-        price: Optional[float] = None
+        reference_price: Optional[float] = None
         if signal.order_type == "limit":
-            price = signal.limit_price if signal.limit_price is not None else signal.price
+            reference_price = signal.limit_price if signal.limit_price is not None else signal.price
         elif signal.order_type == "stop":
-            price = signal.stop_price if signal.stop_price is not None else signal.price
+            reference_price = signal.stop_price if signal.stop_price is not None else signal.price
+
+        price = reference_price
+        reference_basis: Optional[str] = None
+        effective_spread_price = 0.0
+        spread_embedded_price = 0.0
+        if reference_price is not None:
+            reference_basis = self._reference_basis(symbol)
+            current_spread = self._row_spread_price(symbol, row)
+            target_spread = self._target_spread(symbol)
+            if target_spread is None and current_spread <= 0.0:
+                effective_spread = 0.0
+            else:
+                effective_spread = resolve_effective_spread(
+                    target_spread=target_spread,
+                    current_spread=current_spread,
+                    tick_size=self._tick_size(symbol),
+                    reference_price=float(reference_price),
+                )
+            effective_spread_price = float(effective_spread)
+            if effective_spread > 0.0:
+                price = translate_reference_price(
+                    reference_price=float(reference_price),
+                    action=signal.action,
+                    spread_price=effective_spread,
+                    reference_basis=reference_basis,
+                )
+                spread_embedded_price = abs(float(price) - float(reference_price))
 
         # Parity with live runtime `_resolve_entry_price`: gate on the order's
         # actual entry price (limit/stop) when set; fall back to close for market.
@@ -1189,6 +1379,12 @@ class Backtester:
             created_at=signal.when,
             stop_points=stop_points,
             take_points=take_points,
+            reference_price=(
+                float(reference_price) if reference_price is not None else None
+            ),
+            reference_basis=reference_basis,
+            effective_spread_price=effective_spread_price,
+            spread_embedded_price=float(spread_embedded_price),
             valid_until=valid_until,
             tif=signal.tif,
             strategy=getattr(strategy, "name", strategy.__class__.__name__),
@@ -1197,25 +1393,27 @@ class Backtester:
 
     def _try_fill_order(self, order: Order, row: pd.Series) -> Optional[float]:
         if order.type == "market":
-            fill = row["open"] if self.cfg.market_fill_price == "open" else row["close"]
+            fill = row["open"] if self.cfg.market_fill_price == "next_open" else row["close"]
             order.status = "filled"
             return float(fill)
 
         if order.type == "limit":
-            if order.side == "buy" and row["low"] <= float(order.price):
+            quote_low, quote_high = self._execution_quote_range(order, row)
+            if order.side == "buy" and quote_low <= float(order.price):
                 order.status = "filled"
                 return float(order.price)
-            if order.side == "sell" and row["high"] >= float(order.price):
+            if order.side == "sell" and quote_high >= float(order.price):
                 order.status = "filled"
                 return float(order.price)
             order.status = "working"
             return None
 
         if order.type == "stop":
-            if order.side == "buy" and row["high"] >= float(order.price):
+            quote_low, quote_high = self._execution_quote_range(order, row)
+            if order.side == "buy" and quote_high >= float(order.price):
                 order.status = "filled"
                 return float(order.price)
-            if order.side == "sell" and row["low"] <= float(order.price):
+            if order.side == "sell" and quote_low <= float(order.price):
                 order.status = "filled"
                 return float(order.price)
             order.status = "working"
@@ -1231,10 +1429,23 @@ class Backtester:
         fill_time: pd.Timestamp,
         equity: float,
     ) -> tuple[Optional[Trade], float]:
-        commission = costs.commission_one_side(symbol, float(fill_price), order.volume)
-        spread_cost = self._half_spread_cost(symbol, row, order.volume)
+        commission = self._commission_one_side(
+            symbol,
+            row,
+            float(fill_price),
+            order.volume,
+        )
+        spread_aware_pending = (
+            order.type in {"limit", "stop"}
+            and getattr(order, "reference_basis", None) is not None
+        )
+        spread_cost = (
+            0.0
+            if spread_aware_pending
+            else self._half_spread_cost(symbol, row, order.volume)
+        )
         slippage_points = self._slippage_points(symbol, row)
-        slippage_cost_val = costs.slippage_cost(symbol, slippage_points, order.volume)
+        slippage_cost_val = self._slippage_cost(symbol, row, slippage_points, order.volume)
         equity -= commission + spread_cost + slippage_cost_val
 
         trade = Trade(
@@ -1251,7 +1462,64 @@ class Backtester:
             order_id=order.id,
             strategy=order.strategy,
             magic=order.magic,
+            reference_entry_price=(
+                float(order.reference_price)
+                if spread_aware_pending and order.reference_price is not None
+                else None
+            ),
+            reference_basis=(
+                order.reference_basis if spread_aware_pending else None
+            ),
+            spread_aware_pending=spread_aware_pending,
         )
+        if spread_aware_pending:
+            embedded_price = max(
+                float(getattr(order, "spread_embedded_price", 0.0) or 0.0),
+                0.0,
+            )
+            trade.notes["embedded_spread_cost"] = (
+                embedded_price
+                * costs.get_point_value(symbol)
+                * float(order.volume)
+            )
+            trade.notes["spread_aware_pending"] = 1.0
+            reference_entry = float(order.reference_price)
+            close_action = "sell" if order.side == "buy" else "buy"
+            stop_reference = (
+                reference_entry - float(order.stop_points)
+                if order.side == "buy"
+                else reference_entry + float(order.stop_points)
+            )
+            take_reference = (
+                reference_entry + float(order.take_points)
+                if order.side == "buy"
+                else reference_entry - float(order.take_points)
+            )
+            effective_spread = float(
+                getattr(order, "effective_spread_price", 0.0) or 0.0
+            )
+            if effective_spread <= 0.0:
+                effective_spread = float(self._target_spread(symbol) or 0.0)
+            if effective_spread <= 0.0:
+                effective_spread = self._row_spread_price(symbol, row)
+            if effective_spread and effective_spread > 0.0:
+                trade.protective_stop_price = translate_reference_price(
+                    reference_price=stop_reference,
+                    action=close_action,
+                    spread_price=float(effective_spread),
+                    reference_basis=str(order.reference_basis),
+                )
+                if float(order.take_points) > 0.0:
+                    trade.protective_take_price = translate_reference_price(
+                        reference_price=take_reference,
+                        action=close_action,
+                        spread_price=float(effective_spread),
+                        reference_basis=str(order.reference_basis),
+                    )
+            else:
+                trade.protective_stop_price = stop_reference
+                if float(order.take_points) > 0.0:
+                    trade.protective_take_price = take_reference
         trade._last_swap_day = fill_time.normalize()
         return trade, equity
 
@@ -1265,7 +1533,7 @@ class Backtester:
         gross_equity: float,
         trades: List[Trade],
     ) -> tuple[float, float, Optional[Trade]]:
-        pv = costs.get_point_value(symbol)
+        pv = self._account_point_value(symbol, row)
         if pv == 0:
             return equity, gross_equity, trade
         if not self.cfg.apply_stop_take:
@@ -1273,7 +1541,27 @@ class Backtester:
 
         stop_hit = False
         take_hit = False
-        if trade.side == "long":
+        if trade.spread_aware_pending:
+            stop_price = float(trade.protective_stop_price)
+            take_price = (
+                None
+                if trade.protective_take_price is None
+                else float(trade.protective_take_price)
+            )
+            close_action = "sell" if trade.side == "long" else "buy"
+            quote_low, quote_high = self._quote_range_for_side(
+                symbol,
+                close_action,
+                str(trade.reference_basis),
+                row,
+            )
+            if trade.side == "long":
+                stop_hit = quote_low <= stop_price
+                take_hit = take_price is not None and quote_high >= take_price
+            else:
+                stop_hit = quote_high >= stop_price
+                take_hit = take_price is not None and quote_low <= take_price
+        elif trade.side == "long":
             stop_price = trade.entry_price - trade.stop_points
             take_price = trade.entry_price + trade.take_points if trade.take_points > 0 else None
             stop_hit = row["low"] <= stop_price
@@ -1312,10 +1600,19 @@ class Backtester:
                 fill = take_price if take_price is not None else row["close"]
                 pnl = (trade.entry_price - fill) * pv * trade.volume
 
-        commission = costs.commission_one_side(symbol, float(fill), trade.volume)
-        spread_cost = self._half_spread_cost(symbol, row, trade.volume)
+        commission = self._commission_one_side(
+            symbol,
+            row,
+            float(fill),
+            trade.volume,
+        )
+        spread_cost = (
+            0.0
+            if trade.spread_aware_pending
+            else self._half_spread_cost(symbol, row, trade.volume)
+        )
         slippage_points = self._slippage_points(symbol, row)
-        slippage_cost_val = costs.slippage_cost(symbol, slippage_points, trade.volume)
+        slippage_cost_val = self._slippage_cost(symbol, row, slippage_points, trade.volume)
         trade.exit_time = ts
         trade.exit_price = float(fill)
         trade.gross_pnl = pnl
@@ -1327,6 +1624,25 @@ class Backtester:
         trade.net_pnl = trade.gross_pnl - total_costs + trade.swap_pnl
         trade.notes["exit_stop"] = 1.0 if stop_hit else 0.0
         trade.notes["exit_take"] = 1.0 if take_hit else 0.0
+        if trade.spread_aware_pending:
+            reference_entry = float(trade.reference_entry_price)
+            if stop_hit:
+                reference_exit = (
+                    reference_entry - trade.stop_points
+                    if trade.side == "long"
+                    else reference_entry + trade.stop_points
+                )
+            else:
+                reference_exit = (
+                    reference_entry + trade.take_points
+                    if trade.side == "long"
+                    else reference_entry - trade.take_points
+                )
+            trade.notes["embedded_exit_spread_cost"] = (
+                abs(float(fill) - float(reference_exit))
+                * pv
+                * float(trade.volume)
+            )
         equity += trade.pnl
         gross_equity += trade.gross_pnl
         trades.append(trade)
@@ -1350,14 +1666,15 @@ class Backtester:
         if not self.cfg.apply_stop_take or not trades_to_check:
             return trades_to_check, equity, gross_equity
 
-        pv = costs.get_point_value(symbol)
+        pv = self._account_point_value(symbol, row)
         if pv == 0:
             return trades_to_check, equity, gross_equity
 
         n = len(trades_to_check)
 
-        # Scalar path for small trade counts (array overhead dominates)
-        if n <= 3:
+        # Quote-side protective prices carry per-trade basis metadata and use
+        # executable Bid/Ask ranges, so keep them on the scalar path.
+        if n <= 3 or any(t.spread_aware_pending for t in trades_to_check):
             updated: List[Trade] = []
             for trade in trades_to_check:
                 equity, gross_equity, maybe_open = self._maybe_close_trade(
@@ -1395,10 +1712,10 @@ class Backtester:
             else:
                 pnl = (trade.entry_price - fill) * pv * trade.volume
 
-            commission = costs.commission_one_side(symbol, fill, trade.volume)
+            commission = self._commission_one_side(symbol, row, fill, trade.volume)
             spread_cost = self._half_spread_cost(symbol, row, trade.volume)
             slippage_pts = self._slippage_points(symbol, row)
-            slippage_cost_val = costs.slippage_cost(symbol, slippage_pts, trade.volume)
+            slippage_cost_val = self._slippage_cost(symbol, row, slippage_pts, trade.volume)
 
             trade.exit_time = ts
             trade.exit_price = fill
@@ -1532,18 +1849,41 @@ class Backtester:
         trades: List[Trade],
         reason: str = "force",
     ) -> tuple[float, float, Optional[Trade]]:
-        pv = costs.get_point_value(symbol)
+        pv = self._account_point_value(symbol, row)
         if pv == 0:
             return equity, gross_equity, trade
-        fill_price = row["open"] if self.cfg.exit_fill_price == "open" else row["close"]
+        reference_fill_price = (
+            row["open"] if self.cfg.exit_fill_price == "open" else row["close"]
+        )
+        fill_price = float(reference_fill_price)
+        if trade.spread_aware_pending:
+            spread = self._row_spread_price(symbol, row)
+            if spread <= 0.0:
+                spread = float(self._target_spread(symbol) or 0.0)
+            if spread > 0.0:
+                fill_price = translate_reference_price(
+                    reference_price=float(reference_fill_price),
+                    action="sell" if trade.side == "long" else "buy",
+                    spread_price=spread,
+                    reference_basis=str(trade.reference_basis),
+                )
         if trade.side == "long":
             pnl = (fill_price - trade.entry_price) * pv * trade.volume
         else:
             pnl = (trade.entry_price - fill_price) * pv * trade.volume
-        commission = costs.commission_one_side(symbol, float(fill_price), trade.volume)
-        spread_cost = self._half_spread_cost(symbol, row, trade.volume)
+        commission = self._commission_one_side(
+            symbol,
+            row,
+            float(fill_price),
+            trade.volume,
+        )
+        spread_cost = (
+            0.0
+            if trade.spread_aware_pending
+            else self._half_spread_cost(symbol, row, trade.volume)
+        )
         slippage_points = self._slippage_points(symbol, row)
-        slippage_cost_val = costs.slippage_cost(symbol, slippage_points, trade.volume)
+        slippage_cost_val = self._slippage_cost(symbol, row, slippage_points, trade.volume)
         trade.exit_time = ts
         trade.exit_price = float(fill_price)
         trade.gross_pnl = pnl
@@ -1554,6 +1894,12 @@ class Backtester:
         total_costs = trade.commission_paid + trade.spread_cost + trade.slippage_cost
         trade.net_pnl = trade.gross_pnl - total_costs + trade.swap_pnl
         trade.notes[f"exit_{reason}"] = 1.0
+        if trade.spread_aware_pending:
+            trade.notes["embedded_exit_spread_cost"] = (
+                abs(float(fill_price) - float(reference_fill_price))
+                * pv
+                * float(trade.volume)
+            )
         equity += trade.pnl
         gross_equity += trade.gross_pnl
         trades.append(trade)
@@ -1666,7 +2012,7 @@ class Backtester:
         reason: str,
     ) -> tuple[float, float, Optional[Trade]]:
         symbol = trade.symbol
-        pv = costs.get_point_value(symbol)
+        pv = self._account_point_value(symbol, row)
         if pv == 0:
             return equity, gross_equity, trade
         fill_price = row["open"] if self.cfg.exit_fill_price == "open" else row["close"]
@@ -1686,10 +2032,10 @@ class Backtester:
         entry_slippage = trade.slippage_cost * entry_ratio
         entry_swap = trade.swap_pnl * entry_ratio
 
-        close_commission = costs.commission_one_side(symbol, float(fill_price), target)
+        close_commission = self._commission_one_side(symbol, row, float(fill_price), target)
         close_spread = self._half_spread_cost(symbol, row, target)
         slippage_points = self._slippage_points(symbol, row)
-        close_slippage = costs.slippage_cost(symbol, slippage_points, target)
+        close_slippage = self._slippage_cost(symbol, row, slippage_points, target)
 
         closed_trade = Trade(
             symbol=trade.symbol,
@@ -1734,8 +2080,12 @@ class Backtester:
         return (price - trade.entry_price) if kind == "sl" else (trade.entry_price - price)
 
     def _slippage_points(self, symbol: str, row: pd.Series) -> float:
-        tick = self._tick_size(symbol)
-        base = float(self.cfg.default_slippage_points) * tick
+        configured_points = float(self.cfg.default_slippage_points)
+        base = (
+            configured_points * self._tick_size(symbol)
+            if configured_points != 0.0
+            else 0.0
+        )
         if self.cfg.slippage_atr_multiplier > 0 and "atr" in row and not pd.isna(row["atr"]):
             base += float(row["atr"]) * self.cfg.slippage_atr_multiplier
         return base if base else 0.0
@@ -1751,22 +2101,174 @@ class Backtester:
             return 0.0
         return max(spread_points, 0.0)
 
+    def _target_spread(self, symbol: str) -> Optional[float]:
+        inst = self.instruments.get(symbol)
+        if inst is not None and inst.target_spread is not None:
+            return float(inst.target_spread)
+        try:
+            from arbitrix_core.symbols.context import get_symbol_context
+
+            ctx = get_symbol_context(symbol)
+        except (ImportError, KeyError):
+            return None
+        return None if ctx.target_spread is None else float(ctx.target_spread)
+
+    def _validate_target_spread_at_startup(
+        self,
+        symbol: str,
+        frame: pd.DataFrame,
+    ) -> None:
+        target_spread = self._target_spread(symbol)
+        if target_spread is None:
+            return
+        close = pd.to_numeric(frame.get("close"), errors="coerce")
+        if close is None:
+            reference_price = float("nan")
+        else:
+            finite = close[np.isfinite(close.to_numpy(dtype=float))]
+            reference_price = float(finite.iloc[0]) if not finite.empty else float("nan")
+        validate_spread_price(
+            target_spread,
+            tick_size=self._tick_size(symbol),
+            reference_price=reference_price,
+        )
+
+    def _reference_basis(self, symbol: str) -> str:
+        configured = self.reference_basis_by_symbol.get(str(symbol).lower())
+        if configured in {"BID", "ASK", "MIDPOINT", "TRADES"}:
+            return configured
+        inst = self.instruments.get(symbol)
+        raw = getattr(inst, "what_to_show", None) if inst is not None else None
+        basis = str(raw or "BID").strip().upper()
+        return basis if basis in {"BID", "ASK", "MIDPOINT", "TRADES"} else "BID"
+
+    def _row_spread_price(self, symbol: str, row: pd.Series) -> float:
+        try:
+            points = float(row.get("spread", 0.0))
+        except (TypeError, ValueError):
+            return 0.0
+        if not math.isfinite(points) or points <= 0.0:
+            return 0.0
+        return points * self._tick_size(symbol)
+
+    def _execution_quote_range(
+        self,
+        order: Order,
+        row: pd.Series,
+    ) -> tuple[float, float]:
+        basis = getattr(order, "reference_basis", None)
+        if basis is None:
+            return float(row["low"]), float(row["high"])
+        return self._quote_range_for_side(
+            order.symbol,
+            order.side,
+            str(basis),
+            row,
+        )
+
+    def _quote_range_for_side(
+        self,
+        symbol: str,
+        side: str,
+        reference_basis: str,
+        row: pd.Series,
+    ) -> tuple[float, float]:
+        low = float(row["low"])
+        high = float(row["high"])
+
+        spread = self._row_spread_price(symbol, row)
+        if spread <= 0.0:
+            target = self._target_spread(symbol)
+            spread = float(target) if target is not None else 0.0
+        if spread <= 0.0:
+            return low, high
+
+        return (
+            translate_reference_price(
+                reference_price=low,
+                action=side,
+                spread_price=spread,
+                reference_basis=reference_basis,
+            ),
+            translate_reference_price(
+                reference_price=high,
+                action=side,
+                spread_price=spread,
+                reference_basis=reference_basis,
+            ),
+        )
+
     def _half_spread_cost(self, symbol: str, row: pd.Series, volume: float) -> float:
         spread_points = self._spread_points(row)
         if spread_points <= 0.0:
             return 0.0
-        return costs.spread_cost(symbol, spread_points, volume) / 2.0
+        with (
+            costs.using_point_value(symbol, self._account_point_value(symbol, row)),
+            costs.using_tick_size(symbol, self._tick_size(symbol)),
+        ):
+            return costs.spread_cost(symbol, spread_points, volume) / 2.0
+
+    def _slippage_cost(
+        self,
+        symbol: str,
+        row: pd.Series,
+        slippage_points: float,
+        volume: float,
+    ) -> float:
+        if slippage_points <= 0.0 or volume <= 0.0:
+            return 0.0
+        with (
+            costs.using_point_value(symbol, self._account_point_value(symbol, row)),
+            costs.using_tick_size(symbol, self._tick_size(symbol)),
+        ):
+            return costs.slippage_cost(symbol, slippage_points, volume)
+
+    def _commission_one_side(
+        self,
+        symbol: str,
+        row: pd.Series,
+        price: float,
+        volume: float,
+    ) -> float:
+        with costs.using_point_value(symbol, self._account_point_value(symbol, row)):
+            return costs.commission_one_side(symbol, price, volume)
+
+    @staticmethod
+    def _account_point_value(symbol: str, row: pd.Series) -> float:
+        if hasattr(row, "get"):
+            candidate = row.get("__account_point_value__")
+            try:
+                value = float(candidate)
+            except (TypeError, ValueError):
+                value = float("nan")
+            if math.isfinite(value) and value > 0:
+                return value
+        return costs.get_point_value(symbol)
 
     def _tick_size(self, symbol: str) -> float:
         inst = self.instruments.get(symbol)
         if inst and inst.tick_size:
-            return float(inst.tick_size)
-        return 1.0
+            value = float(inst.tick_size)
+            if math.isfinite(value) and value > 0:
+                return value
+        try:
+            from arbitrix_core.symbols.context import get_symbol_context
+
+            value = float(get_symbol_context(symbol).tick_size)
+        except (KeyError, ImportError):
+            value = float("nan")
+        if math.isfinite(value) and value > 0:
+            return value
+        raise RuntimeError(
+            f"Tick size unavailable for {symbol}; execution metadata must be resolved "
+            "before Backtester construction"
+        )
 
     def _apply_overnight_swap(
         self,
         symbol: str,
         trade: Trade,
+        row: pd.Series,
         current_day: pd.Timestamp,
         swap_override: Optional[dict],
     ) -> float:
@@ -1783,7 +2285,13 @@ class Backtester:
             override = dict(swap_override or {})
             if weekend and "weekend" not in override:
                 override["weekend"] = True
-            swap_delta = costs.swap_cost_per_day(symbol, trade.volume, direction, static_override=override)
+            with costs.using_point_value(symbol, self._account_point_value(symbol, row)):
+                swap_delta = costs.swap_cost_per_day(
+                    symbol,
+                    trade.volume,
+                    direction,
+                    static_override=override,
+                )
             trade.swap_pnl += swap_delta
             delta_total += swap_delta
         return delta_total

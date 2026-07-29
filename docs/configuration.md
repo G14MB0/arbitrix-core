@@ -15,7 +15,7 @@ Controls global engine behaviour. Pass an instance to `Backtester(cfg)`.
 | `apply_spread_cost` | `bool` | `True` | Whether to charge spread on every trade |
 | `apply_swap_cost` | `bool` | `True` | Whether to accrue daily swap on open trades |
 | `apply_stop_take` | `bool` | `True` | Whether the SL/TP loop runs |
-| `market_fill_price` | `str` | `"close"` | `"open"` or `"close"` — bar reference for entry fills |
+| `market_fill_price` | `str` | `"close"` | `"close"` or `"next_open"` — market entry fill reference. `"open"` is accepted as an alias for `"next_open"` |
 | `exit_fill_price` | `str` | `"close"` | `"open"` or `"close"` — bar reference for exit fills |
 | `intra_bar_model` | `str` | `"sl_first"` | `"sl_first"`, `"tp_first"`, or `"none"` — order of SL/TP checks intra-bar |
 | `trailing_mode` | `str` | `"none"` | Reserved for future trailing-stop modes |
