@@ -1327,7 +1327,17 @@ class Backtester:
             return None
 
         reference_price: Optional[float] = None
-        if signal.order_type == "limit":
+        if signal.order_type == "market":
+            try:
+                market_reference = float(signal.price)
+            except (TypeError, ValueError):
+                market_reference = float(row["close"])
+            reference_price = (
+                market_reference
+                if math.isfinite(market_reference) and market_reference > 0.0
+                else float(row["close"])
+            )
+        elif signal.order_type == "limit":
             reference_price = signal.limit_price if signal.limit_price is not None else signal.price
         elif signal.order_type == "stop":
             reference_price = signal.stop_price if signal.stop_price is not None else signal.price
@@ -1336,7 +1346,7 @@ class Backtester:
         reference_basis: Optional[str] = None
         effective_spread_price = 0.0
         spread_embedded_price = 0.0
-        if reference_price is not None:
+        if reference_price is not None and signal.order_type in {"limit", "stop"}:
             reference_basis = self._reference_basis(symbol)
             current_spread = self._row_spread_price(symbol, row)
             target_spread = self._target_spread(symbol)
@@ -1379,9 +1389,7 @@ class Backtester:
             created_at=signal.when,
             stop_points=stop_points,
             take_points=take_points,
-            reference_price=(
-                float(reference_price) if reference_price is not None else None
-            ),
+            reference_price=(float(reference_price) if reference_price is not None else None),
             reference_basis=reference_basis,
             effective_spread_price=effective_spread_price,
             spread_embedded_price=float(spread_embedded_price),
@@ -1439,6 +1447,11 @@ class Backtester:
             order.type in {"limit", "stop"}
             and getattr(order, "reference_basis", None) is not None
         )
+        absolute_market_protection = (
+            order.type == "market"
+            and getattr(order, "reference_price", None) is not None
+        )
+        has_protective_reference = spread_aware_pending or absolute_market_protection
         spread_cost = (
             0.0
             if spread_aware_pending
@@ -1464,7 +1477,7 @@ class Backtester:
             magic=order.magic,
             reference_entry_price=(
                 float(order.reference_price)
-                if spread_aware_pending and order.reference_price is not None
+                if has_protective_reference and order.reference_price is not None
                 else None
             ),
             reference_basis=(
@@ -1520,6 +1533,20 @@ class Backtester:
                 trade.protective_stop_price = stop_reference
                 if float(order.take_points) > 0.0:
                     trade.protective_take_price = take_reference
+        elif absolute_market_protection:
+            reference_entry = float(order.reference_price)
+            trade.protective_stop_price = (
+                reference_entry - float(order.stop_points)
+                if order.side == "buy"
+                else reference_entry + float(order.stop_points)
+            )
+            if float(order.take_points) > 0.0:
+                trade.protective_take_price = (
+                    reference_entry + float(order.take_points)
+                    if order.side == "buy"
+                    else reference_entry - float(order.take_points)
+                )
+            trade.notes["absolute_market_protection"] = 1.0
         trade._last_swap_day = fill_time.normalize()
         return trade, equity
 
@@ -1541,26 +1568,33 @@ class Backtester:
 
         stop_hit = False
         take_hit = False
-        if trade.spread_aware_pending:
+        if trade.protective_stop_price is not None:
             stop_price = float(trade.protective_stop_price)
             take_price = (
                 None
                 if trade.protective_take_price is None
                 else float(trade.protective_take_price)
             )
-            close_action = "sell" if trade.side == "long" else "buy"
-            quote_low, quote_high = self._quote_range_for_side(
-                symbol,
-                close_action,
-                str(trade.reference_basis),
-                row,
-            )
-            if trade.side == "long":
-                stop_hit = quote_low <= stop_price
-                take_hit = take_price is not None and quote_high >= take_price
+            if trade.spread_aware_pending:
+                close_action = "sell" if trade.side == "long" else "buy"
+                quote_low, quote_high = self._quote_range_for_side(
+                    symbol,
+                    close_action,
+                    str(trade.reference_basis),
+                    row,
+                )
+                if trade.side == "long":
+                    stop_hit = quote_low <= stop_price
+                    take_hit = take_price is not None and quote_high >= take_price
+                else:
+                    stop_hit = quote_high >= stop_price
+                    take_hit = take_price is not None and quote_low <= take_price
+            elif trade.side == "long":
+                stop_hit = row["low"] <= stop_price
+                take_hit = take_price is not None and row["high"] >= take_price
             else:
-                stop_hit = quote_high >= stop_price
-                take_hit = take_price is not None and quote_low <= take_price
+                stop_hit = row["high"] >= stop_price
+                take_hit = take_price is not None and row["low"] <= take_price
         elif trade.side == "long":
             stop_price = trade.entry_price - trade.stop_points
             take_price = trade.entry_price + trade.take_points if trade.take_points > 0 else None
@@ -1674,7 +1708,7 @@ class Backtester:
 
         # Quote-side protective prices carry per-trade basis metadata and use
         # executable Bid/Ask ranges, so keep them on the scalar path.
-        if n <= 3 or any(t.spread_aware_pending for t in trades_to_check):
+        if n <= 3 or any(t.protective_stop_price is not None for t in trades_to_check):
             updated: List[Trade] = []
             for trade in trades_to_check:
                 equity, gross_equity, maybe_open = self._maybe_close_trade(
@@ -1979,8 +2013,12 @@ class Backtester:
 
             if action == "modify_sl" and signal.new_sl is not None:
                 trade.stop_points = self._points_from_price(trade, signal.new_sl, kind="sl")
+                if trade.protective_stop_price is not None:
+                    trade.protective_stop_price = float(signal.new_sl)
             if action == "modify_tp" and signal.new_tp is not None:
                 trade.take_points = self._points_from_price(trade, signal.new_tp, kind="tp")
+                if trade.protective_stop_price is not None:
+                    trade.protective_take_price = float(signal.new_tp)
             return equity, gross_equity, open_trades, working_orders
 
         if action == "cancel_order":
