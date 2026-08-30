@@ -7,6 +7,9 @@ from arbitrix_core.strategies.base import (
     strategy_supports_parameter,
     strategy_supports_regime_output,
 )
+from arbitrix_core.strategies.deterministic_parity import (
+    DeterministicMultiMarketParityStrategy,
+)
 
 __all__ = [
     "BaseStrategy",
@@ -16,4 +19,5 @@ __all__ = [
     "invoke_strategy_take_distance_points",
     "strategy_supports_parameter",
     "strategy_supports_regime_output",
+    "DeterministicMultiMarketParityStrategy",
 ]

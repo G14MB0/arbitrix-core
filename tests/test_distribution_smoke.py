@@ -70,9 +70,11 @@ from arbitrix_core import (
     PreparedMarket,
     Signal,
 )
+from arbitrix_core.strategies import DeterministicMultiMarketParityStrategy
 
 installed = Path(sys.argv[1]).resolve()
 assert Path(arbitrix_core.__file__).resolve().is_relative_to(installed)
+assert DeterministicMultiMarketParityStrategy.duration_minutes == 20
 
 primary = FeedKey("main", "EURUSD", "M1")
 target = FeedKey("main", "GBPUSD", "M1")
