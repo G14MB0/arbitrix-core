@@ -6,12 +6,26 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from arbitrix_core import costs
 from arbitrix_core.backtest.bar_view import BarViewSource
 from arbitrix_core.backtest.engine import Backtester, BTConfig
 from arbitrix_core.strategies.base import BaseStrategy
 from arbitrix_core.trading import Signal
+from arbitrix_core.types import InstrumentConfig
+
+
+def _instruments(symbol: str, tick_size: float) -> dict[str, InstrumentConfig]:
+    return {
+        symbol: InstrumentConfig(
+            ib_symbol=symbol,
+            point_value=1.0,
+            contract_size=1.0,
+            tick_size=tick_size,
+            min_order_size=0.01,
+        )
+    }
 
 
 def _frame(periods: int = 20) -> pd.DataFrame:
@@ -92,7 +106,8 @@ def test_backtester_bar_view_mode_matches_series_mode() -> None:
     frame = _frame()
 
     series_result = Backtester(
-        BTConfig(commission_per_lot=0.0, apply_swap_cost=False)
+        BTConfig(commission_per_lot=0.0, apply_swap_cost=False),
+        instruments=_instruments("TEST", 0.01),
     ).run_single(
         frame.copy(),
         _ParityStrategy(),
@@ -100,7 +115,8 @@ def test_backtester_bar_view_mode_matches_series_mode() -> None:
         initial_equity=10_000.0,
     )
     bar_view_result = Backtester(
-        BTConfig(commission_per_lot=0.0, apply_swap_cost=False, row_mode="bar_view")
+        BTConfig(commission_per_lot=0.0, apply_swap_cost=False, row_mode="bar_view"),
+        instruments=_instruments("TEST", 0.01),
     ).run_single(
         frame.copy(),
         _ParityStrategy(),
@@ -128,6 +144,8 @@ def test_prev_day_breakout_advanced_bar_view_matches_series_mode() -> None:
         / ".connections"
         / "b46a14ccc06172ff"
     )
+    if not strategy_root.exists():
+        pytest.skip("proprietary strategy fixture is unavailable in extracted open-core checkout")
     sys.path.insert(0, str(strategy_root))
     try:
         from PrevDayBreakoutAdvanced.strategy import (  # type: ignore[import-not-found]
@@ -167,7 +185,8 @@ def test_prev_day_breakout_advanced_bar_view_matches_series_mode() -> None:
 
     costs.configure(commission_per_lot=0.0, point_overrides={"Usa500": 1.0})
     series_result = Backtester(
-        BTConfig(commission_per_lot=0.0, apply_swap_cost=False, apply_spread_cost=False)
+        BTConfig(commission_per_lot=0.0, apply_swap_cost=False, apply_spread_cost=False),
+        instruments=_instruments("Usa500", 0.1),
     ).run_single(
         frame.copy(),
         PrevDayBreakoutAdvanced(StrategyConfig(**cfg_kwargs)),
@@ -182,7 +201,8 @@ def test_prev_day_breakout_advanced_bar_view_matches_series_mode() -> None:
             apply_swap_cost=False,
             apply_spread_cost=False,
             row_mode="bar_view",
-        )
+        ),
+        instruments=_instruments("Usa500", 0.1),
     ).run_single(
         frame.copy(),
         PrevDayBreakoutAdvanced(StrategyConfig(**cfg_kwargs)),

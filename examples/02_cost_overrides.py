@@ -10,6 +10,7 @@ from arbitrix_core import BTConfig, Backtester, costs, load_ohlcv
 
 quickstart = import_module("01_quickstart")
 SimpleMeanReversion = quickstart.SimpleMeanReversion
+INSTRUMENTS = quickstart.INSTRUMENTS
 
 
 def run_with(
@@ -31,7 +32,7 @@ def run_with(
         },
     )
     cfg = BTConfig(commission_per_lot=commission, apply_swap_cost=False)
-    bt = Backtester(cfg)
+    bt = Backtester(cfg, instruments=INSTRUMENTS)
     res = bt.run_single(
         df, SimpleMeanReversion(), risk_perc=0.01, initial_equity=10_000.0
     )

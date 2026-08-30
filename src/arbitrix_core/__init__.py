@@ -10,7 +10,15 @@ MIT-licensed subset of the Arbitrix trading toolkit. Provides:
 """
 from arbitrix_core import costs
 from arbitrix_core.backtest import Backtester, BTConfig, BTResult
-from arbitrix_core.data import DataProvider, load_ohlcv, validate_ohlcv
+from arbitrix_core.data import (
+    DataProvider,
+    FeedKey,
+    MarketBars,
+    MarketFrames,
+    PreparedMarket,
+    load_ohlcv,
+    validate_ohlcv,
+)
 from arbitrix_core.strategies import BaseStrategy
 from arbitrix_core.trading import Order, Position, Signal, Trade
 from arbitrix_core.types import InstrumentConfig
@@ -31,6 +39,10 @@ __all__ = [
     "Position",
     "InstrumentConfig",
     "DataProvider",
+    "FeedKey",
+    "MarketFrames",
+    "PreparedMarket",
+    "MarketBars",
     "load_ohlcv",
     "validate_ohlcv",
     "costs",

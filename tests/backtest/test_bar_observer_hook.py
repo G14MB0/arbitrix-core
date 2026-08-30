@@ -8,6 +8,18 @@ from arbitrix_core import costs
 from arbitrix_core.backtest.engine import Backtester, BTConfig
 from arbitrix_core.strategies.base import BaseStrategy
 from arbitrix_core.trading import Signal
+from arbitrix_core.types import InstrumentConfig
+
+
+X_INSTRUMENTS = {
+    "X": InstrumentConfig(
+        ib_symbol="X",
+        point_value=1.0,
+        contract_size=1.0,
+        tick_size=0.01,
+        min_order_size=0.01,
+    )
+}
 
 
 class _NoopStrategy(BaseStrategy):
@@ -161,7 +173,10 @@ def test_bar_observer_default_none_is_no_op():
 
     costs.configure(commission_per_lot=0.0, point_overrides={"X": 1.0})
     df = _df_signal()
-    bt_none = Backtester(BTConfig(commission_per_lot=0.0, apply_swap_cost=False))
+    bt_none = Backtester(
+        BTConfig(commission_per_lot=0.0, apply_swap_cost=False),
+        instruments=X_INSTRUMENTS,
+    )
     res_none = bt_none.run_single(
         df.copy(),
         _BuyOnBarTwoStrategy(),
@@ -169,7 +184,10 @@ def test_bar_observer_default_none_is_no_op():
         initial_equity=10_000.0,
     )
 
-    bt_noop = Backtester(BTConfig(commission_per_lot=0.0, apply_swap_cost=False))
+    bt_noop = Backtester(
+        BTConfig(commission_per_lot=0.0, apply_swap_cost=False),
+        instruments=X_INSTRUMENTS,
+    )
     res_noop = bt_noop.run_single(
         df.copy(),
         _BuyOnBarTwoStrategy(),
@@ -215,7 +233,10 @@ def test_bar_observer_receives_full_context():
     def observer(ctx):
         captured.append(dict(ctx))
 
-    bt = Backtester(BTConfig(commission_per_lot=0.0, apply_swap_cost=False))
+    bt = Backtester(
+        BTConfig(commission_per_lot=0.0, apply_swap_cost=False),
+        instruments=X_INSTRUMENTS,
+    )
     bt.run_single(_df(), _NoopStrategy(), risk_perc=0.005, initial_equity=10_000.0,
                   bar_observer=observer)
 
@@ -245,7 +266,10 @@ def test_bar_observer_captures_signals_and_fills():
             }
         )
 
-    bt = Backtester(BTConfig(commission_per_lot=0.0, apply_swap_cost=False))
+    bt = Backtester(
+        BTConfig(commission_per_lot=0.0, apply_swap_cost=False),
+        instruments=X_INSTRUMENTS,
+    )
     bt.run_single(
         df,
         _BuyOnBarTwoStrategy(),

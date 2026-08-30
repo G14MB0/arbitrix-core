@@ -8,8 +8,7 @@ dynamic = ["version"]
 description = "MIT-licensed open-source backtest engine and cost model from the Arbitrix trading toolkit."
 readme = "README.md"
 requires-python = ">=3.10"
-license = "MIT"
-license-files = ["LICENSE"]
+license = { file = "LICENSE" }
 authors = [{ name = "Arbitrix Team" }]
 keywords = ["backtesting", "quant", "trading", "finance", "cost-model"]
 classifiers = [
@@ -32,9 +31,11 @@ dependencies = [
 [project.optional-dependencies]
 fast = ["numba>=0.59"]
 dev = [
+    "build>=1.2",
     "pytest>=8.0",
     "pytest-cov>=4.1",
     "ruff>=0.5",
+    "wheel>=0.43",
 ]
 docs = [
     "mkdocs>=1.5",

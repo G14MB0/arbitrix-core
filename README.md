@@ -24,37 +24,64 @@ Optional extras:
 ```python
 import pandas as pd
 
-from arbitrix_core import Backtester, BTConfig, Signal, BaseStrategy
+from arbitrix_core import Backtester, BTConfig, Signal, BaseStrategy, InstrumentConfig
 from arbitrix_core import costs
 from arbitrix_core import load_ohlcv
 
 
 class SmaCross(BaseStrategy):
-    def generate_signals(self, df):
+    symbol = "EURUSD"
+    timeframe = "H1"
+
+    def prepare(self, df):
+        prepared = df.copy()
         fast = df["close"].rolling(10).mean()
         slow = df["close"].rolling(30).mean()
-        signals = []
-        for i in range(1, len(df)):
-            if fast.iloc[i - 1] < slow.iloc[i - 1] and fast.iloc[i] > slow.iloc[i]:
-                signals.append(Signal(when=df.index[i], action="buy", price=df["close"].iloc[i]))
-            elif fast.iloc[i - 1] > slow.iloc[i - 1] and fast.iloc[i] < slow.iloc[i]:
-                signals.append(Signal(when=df.index[i], action="sell", price=df["close"].iloc[i]))
-        return signals
+        prepared["cross_up"] = (fast.shift(1) <= slow.shift(1)) & (fast > slow)
+        prepared["cross_down"] = (fast.shift(1) >= slow.shift(1)) & (fast < slow)
+        return prepared.dropna()
+
+    def on_bar(self, row, portfolio):
+        if row["cross_up"]:
+            return [Signal(when=row.name, action="buy", price=float(row["close"]))]
+        if row["cross_down"]:
+            return [Signal(when=row.name, action="sell", price=float(row["close"]))]
+        return []
+
+    def stop_distance_points(self, row):
+        return 0.002
 
 
 df = load_ohlcv("eurusd_h1.csv", time_col="datetime")
 costs.configure(commission_per_lot=3.0, point_overrides={"EURUSD": 10.0}, allow_provider_lookups=False)
-result = Backtester(BTConfig()).run_single(df, SmaCross(), risk_perc=0.01, initial_equity=10_000.0)
+instrument = InstrumentConfig(
+    ib_symbol="EURUSD",
+    point_value=10.0,
+    contract_size=1.0,
+    tick_size=0.0001,
+    min_order_size=0.01,
+)
+result = Backtester(BTConfig(), instruments={"EURUSD": instrument}).run_single(
+    df,
+    SmaCross(),
+    risk_perc=0.01,
+    initial_equity=10_000.0,
+)
 print(result.metrics)
 ```
+
+`run_single` remains the mono-provider API. Multiprovider and multisymbol code
+uses the additive `run_market` API with the `FeedKey` / `MarketFrames` ->
+`PreparedMarket` -> `MarketBars` contract.
 
 Full documentation at https://g14mb0.github.io/arbitrix-core/
 
 ## Sync to public repo
 
-`arbitrix-core` is published from the upstream Arbitrix monorepo via subtree split. The
-private workflow `.github/workflows/arbitrix-core-sync.yml` force-pushes
-`arbitrix/src/arbitrix_core` to https://github.com/G14MB0/arbitrix-core
+`src/arbitrix_core` is the canonical source and is published from the upstream
+Arbitrix monorepo via subtree split. The private workflow
+`.github/workflows/arbitrix-core-sync.yml` force-pushes that subtree to
+https://github.com/G14MB0/arbitrix-core
 on every push to `main` or `development` that touches the subtree, and
 on `workflow_dispatch`.
 

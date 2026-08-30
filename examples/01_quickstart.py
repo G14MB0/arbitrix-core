@@ -9,10 +9,22 @@ from arbitrix_core import (
     BTConfig,
     Backtester,
     BaseStrategy,
+    InstrumentConfig,
     Signal,
     costs,
     load_ohlcv,
 )
+
+
+INSTRUMENTS = {
+    "EURUSD": InstrumentConfig(
+        ib_symbol="EURUSD",
+        point_value=10.0,
+        contract_size=1.0,
+        tick_size=0.0001,
+        min_order_size=0.01,
+    )
+}
 
 
 class SimpleMeanReversion(BaseStrategy):
@@ -60,7 +72,7 @@ def main() -> None:
     )
 
     cfg = BTConfig(commission_per_lot=3.0, apply_swap_cost=False)
-    bt = Backtester(cfg)
+    bt = Backtester(cfg, instruments=INSTRUMENTS)
     result = bt.run_single(
         df, SimpleMeanReversion(), risk_perc=0.01, initial_equity=10_000.0
     )

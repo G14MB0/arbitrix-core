@@ -12,6 +12,7 @@ sys.path.insert(0, str(EXAMPLES))
 
 quickstart = import_module("01_quickstart")
 SimpleMeanReversion = quickstart.SimpleMeanReversion
+INSTRUMENTS = quickstart.INSTRUMENTS
 
 
 def main() -> None:
@@ -26,7 +27,10 @@ def main() -> None:
     active = costs.get_active_cost_model()
     print(f"Active cost model: {active['name']}  ({active['module']})")
 
-    bt = Backtester(BTConfig(commission_per_lot=1.5, apply_swap_cost=False))
+    bt = Backtester(
+        BTConfig(commission_per_lot=1.5, apply_swap_cost=False),
+        instruments=INSTRUMENTS,
+    )
     res = bt.run_single(
         df, SimpleMeanReversion(), risk_perc=0.01, initial_equity=10_000.0
     )

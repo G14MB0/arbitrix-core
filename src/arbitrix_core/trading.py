@@ -52,6 +52,11 @@ class Signal:
     risk_multiplier: float = 1.0
     magic: Optional[int] = None
 
+    symbol: Optional[str] = None
+
+    # TODO(multiprovider): once symbol-aware stop/take hooks are stable, add
+    # optional per-Signal protection overrides for self-contained order intent.
+
     def is_entry(self) -> bool:
         return self.action in ("buy", "sell")
 

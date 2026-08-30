@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import inspect
 import json
 import logging
 import math
@@ -17,6 +16,7 @@ import pandas as pd
 
 import arbitrix_core.costs as costs
 from arbitrix_core.backtest.bar_view import BarViewSource
+from arbitrix_core.data.market import MarketFrames, PreparedMarket
 from arbitrix_core.margin import MarginCallEvent
 from arbitrix_core.portfolio import Portfolio
 from arbitrix_core.symbols.spread_pricing import (
@@ -24,14 +24,17 @@ from arbitrix_core.symbols.spread_pricing import (
     translate_reference_price,
     validate_spread_price,
 )
-from arbitrix_core.strategies.base import BaseStrategy, invoke_strategy_on_bar
+from arbitrix_core.strategies.base import (
+    BaseStrategy,
+    invoke_strategy_on_bar,
+    invoke_strategy_should_exit_trade,
+    invoke_strategy_stop_distance_points,
+    invoke_strategy_take_distance_points,
+)
 from arbitrix_core.trading import Order, Signal, Trade, Position
 from arbitrix_core.types import InstrumentConfig
 
 logger = logging.getLogger(__name__)
-
-
-_ON_BAR_DISPATCH_CACHE: Dict[type, tuple[bool, bool]] = {}
 
 
 def _audit_safe(value: Any) -> Any:
@@ -113,7 +116,24 @@ def _audit_signal_payload(sig: Signal) -> Dict[str, Any]:
         "target_trade_id": getattr(sig, "target_trade_id", None),
         "target_order_id": getattr(sig, "target_order_id", None),
         "magic": getattr(sig, "magic", None),
+        "symbol": getattr(sig, "symbol", None),
     }
+
+
+def _explicit_signal_symbol(signal: Any) -> Optional[str]:
+    """Return only an intentional string route from a Signal-like object.
+
+    Older integrations sometimes emit duck-typed signals or mocks without a
+    real ``symbol`` field.  Coercing an arbitrary attribute value to text
+    would turn those into execution symbols instead of preserving the primary
+    symbol fallback.
+    """
+
+    raw = getattr(signal, "symbol", None)
+    if not isinstance(raw, str):
+        return None
+    value = raw.strip()
+    return value or None
 
 
 def _backtest_audit_writer(strategy_key: str) -> Optional[Callable[[Dict[str, Any]], None]]:
@@ -133,69 +153,62 @@ def _backtest_audit_writer(strategy_key: str) -> Optional[Callable[[Dict[str, An
     return write
 
 
-def _on_bar_dispatch_capabilities(strategy) -> Optional[tuple[bool, bool]]:
-    cls = strategy.__class__
-    cached = _ON_BAR_DISPATCH_CACHE.get(cls)
-    if cached is not None:
-        return cached
+def _invoke_strategy_on_bar(
+    strategy,
+    row,
+    portfolio,
+    regime_output,
+    *,
+    symbol: Optional[str] = None,
+    data: Any = None,
+):
+    """Compatibility entry point backed by exact-name strategy dispatch."""
     try:
-        sig = inspect.signature(strategy.on_bar)
-    except (TypeError, ValueError):
-        return None
+        from arbitrix_core.symbols.context import get_symbol_context
 
-    accepts_ctx = "ctx" in sig.parameters
-    accepts_regime_output = False
-    positional = 0
-    for param in sig.parameters.values():
-        if param.kind == inspect.Parameter.VAR_POSITIONAL:
-            accepts_regime_output = True
-            break
-        if param.kind in {
-            inspect.Parameter.POSITIONAL_ONLY,
-            inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        }:
-            positional += 1
-        if param.kind == inspect.Parameter.KEYWORD_ONLY and param.name == "regime_output":
-            accepts_regime_output = True
-            break
-    if not accepts_regime_output:
-        accepts_regime_output = positional >= 3
-
-    cached = (accepts_ctx, accepts_regime_output)
-    _ON_BAR_DISPATCH_CACHE[cls] = cached
-    return cached
+        ctx = get_symbol_context(symbol or strategy.symbol)
+    except (KeyError, AttributeError):
+        ctx = None
+    if data is None:
+        return invoke_strategy_on_bar(
+            strategy,
+            row,
+            portfolio,
+            regime_output,
+            ctx=ctx,
+        )
+    return invoke_strategy_on_bar(
+        strategy,
+        row,
+        portfolio,
+        regime_output,
+        ctx=ctx,
+        data=data,
+    )
 
 
-def _invoke_strategy_on_bar(strategy, row, portfolio, regime_output):
-    """ARB / Sub-spec 1: pass ctx when the strategy's on_bar accepts it; omit otherwise.
+def _invoke_strategy_should_exit_trade(
+    strategy: BaseStrategy,
+    trade: Trade,
+    row: pd.Series,
+    *,
+    symbol: str,
+    data: Any = None,
+) -> bool:
+    try:
+        from arbitrix_core.symbols.context import get_symbol_context
 
-    Backward-compatible: strategies whose ``on_bar`` was written before the
-    ``ctx`` arg keep working unchanged via :func:`invoke_strategy_on_bar` (which
-    additionally tolerates legacy two-argument signatures without
-    ``regime_output``). New code reads ``ctx`` for per-symbol metadata.
-    """
-    capabilities = _on_bar_dispatch_capabilities(strategy)
-    if capabilities is None:
-        return invoke_strategy_on_bar(strategy, row, portfolio, regime_output)
-
-    accepts_ctx, accepts_regime_output = capabilities
-    if accepts_ctx:
-        try:
-            from arbitrix_core.symbols.context import get_symbol_context
-            ctx = get_symbol_context(strategy.symbol)
-        except (KeyError, AttributeError):
-            ctx = None
-        # Only forward ``regime_output`` positionally when the override actually
-        # accepts it — strategies that opt into ``ctx`` but skip
-        # ``regime_output`` (e.g. ``on_bar(row, portfolio, ctx=None)``) would
-        # otherwise hit "multiple values for argument 'ctx'".
-        if accepts_regime_output:
-            return strategy.on_bar(row, portfolio, regime_output, ctx=ctx)
-        return strategy.on_bar(row, portfolio, ctx=ctx)
-
-    if accepts_regime_output:
-        return strategy.on_bar(row, portfolio, regime_output)
-    return strategy.on_bar(row, portfolio)
+        ctx = get_symbol_context(symbol)
+    except (KeyError, AttributeError):
+        ctx = None
+    return invoke_strategy_should_exit_trade(
+        strategy,
+        trade,
+        row,
+        symbol=symbol,
+        ctx=ctx,
+        data=data,
+    )
 
 
 @dataclass
@@ -229,6 +242,7 @@ class BTResult:
     positions: List["Position"] = field(default_factory=list)
     prepared: Optional[pd.DataFrame] = None
     margin_call_events: List[MarginCallEvent] = field(default_factory=list)
+    prepared_market: Optional[PreparedMarket] = None
 
 
 class Backtester:
@@ -687,6 +701,27 @@ class Backtester:
             open_trades, equity, gross_equity = self._check_stops_vectorized(
                 symbol, pre_sl_trades, row, ts, equity, gross_equity, closed_trades
             )
+            conditional_survivors: List[Trade] = []
+            for trade in open_trades:
+                if _invoke_strategy_should_exit_trade(
+                    strategy,
+                    trade,
+                    row,
+                    symbol=trade.symbol,
+                ):
+                    equity, gross_equity, _ = self._close_trade(
+                        trade.symbol,
+                        trade,
+                        row,
+                        ts,
+                        equity,
+                        gross_equity,
+                        closed_trades,
+                        reason="conditional_exit",
+                    )
+                else:
+                    conditional_survivors.append(trade)
+            open_trades = conditional_survivors
             if runtime_breakdown_enabled:
                 loop_breakdown["stop_check_s"] += max(0.0, time.monotonic() - section_started)
 
@@ -933,191 +968,22 @@ class Backtester:
         finalize_started = time.monotonic()
         _maybe_cancel()
         section_started = time.monotonic() if runtime_breakdown_enabled else 0.0
-        metrics = self._compute_metrics(daily_equity, initial_equity=initial_equity)
-        total_commission = sum(t.commission_paid for t in closed_trades)
-        total_spread = sum(t.spread_cost for t in closed_trades)
-        total_slippage = sum(t.slippage_cost for t in closed_trades)
-        total_swap = sum(t.swap_pnl for t in closed_trades)
-        total_gross = sum(t.gross_pnl for t in closed_trades)
-        total_net = sum(t.net_pnl for t in closed_trades)
-        total_fees = total_commission + total_spread + total_slippage
-        winning_net = sum(t.net_pnl for t in closed_trades if t.net_pnl > 0)
-        losing_net = -sum(t.net_pnl for t in closed_trades if t.net_pnl < 0)
-        gross_abs = abs(total_gross)
-        if gross_abs <= 1e-9:
-            fees_to_gross = 1.0 if total_fees > 0 else 0.0
-        else:
-            fees_to_gross = float(total_fees) / gross_abs
-
-        returns_series, _, _ = self._returns_for_metrics(daily_equity, initial_equity=initial_equity)
-        returns_count = int(len(returns_series))
-        trade_count = int(len(closed_trades))
-        expectancy = float(total_net) / float(trade_count) if trade_count > 0 else 0.0
-        if losing_net <= 1e-9:
-            profit_factor = 10.0 if winning_net > 1e-9 else 0.0
-        else:
-            profit_factor = float(winning_net) / float(losing_net)
+        metrics, metadata = self._build_result_payload(
+            daily_equity=daily_equity,
+            initial_equity=initial_equity,
+            closed_trades=closed_trades,
+            early_stop_conditions=early_stop_conditions,
+            early_stop_flag=early_stop_flag,
+            signal_intents=signal_intents,
+            early_stopped=early_stopped,
+            early_stop_reason=early_stop_reason,
+            bar_count=bar_count,
+        )
+        metadata["primary_symbol"] = symbol
         if runtime_breakdown_enabled:
             finalize_breakdown["metrics_aggregation_s"] += max(
                 0.0,
                 time.monotonic() - section_started,
-            )
-
-        # Robust-score disqualification guardrails are only applied when explicitly provided.
-        # This avoids hidden PSR sample gating coming from unrelated early-stop defaults.
-        default_thresholds = {
-            "sharpe_target": 3.0,
-            "sortino_target": 4.0,
-            "tail_ratio_target": 3.0,
-        }
-        psr_min_trades: Optional[int] = None
-        psr_min_returns: Optional[int] = None
-        psr_min_observations: Optional[int] = None
-        psr_threshold: Optional[float] = None
-        fees_to_gross_limit: Optional[float] = None
-        drawdown_limit: Optional[float] = None
-        turnover_limit: Optional[float] = None
-        sharpe_target = 3.0
-        sortino_target = 4.0
-        tail_ratio_target = 3.0
-        ignore_disqualification = False
-
-        if early_stop_conditions and early_stop_flag:
-            def _get_optional_int(key: str) -> Optional[int]:
-                if key not in early_stop_conditions:
-                    return None
-                try:
-                    return max(0, int(early_stop_conditions.get(key)))
-                except (TypeError, ValueError):
-                    return None
-
-            def _get_optional_float(key: str) -> Optional[float]:
-                if key not in early_stop_conditions:
-                    return None
-                try:
-                    return max(0.0, float(early_stop_conditions.get(key)))
-                except (TypeError, ValueError):
-                    return None
-
-            def _get_setting(key: str, default: Any) -> Any:
-                return early_stop_conditions[key] if key in early_stop_conditions else default
-
-            psr_min_trades = _get_optional_int("psr_min_trades")
-            psr_min_returns = _get_optional_int("psr_min_returns")
-            psr_min_observations = _get_optional_int("psr_min_observations")
-            psr_threshold = _get_optional_float("psr_threshold")
-            fees_to_gross_limit = _get_optional_float("fees_to_gross")
-            drawdown_limit = _get_optional_float("drawdown_threshold")
-            turnover_limit = _get_optional_float("turnover_threshold")
-            sharpe_target = float(
-                _get_setting("sharpe_target", default_thresholds["sharpe_target"]) or default_thresholds["sharpe_target"]
-            )
-            sortino_target = float(
-                _get_setting("sortino_target", default_thresholds["sortino_target"]) or default_thresholds["sortino_target"]
-            )
-            tail_ratio_target = float(
-                _get_setting("tail_ratio_target", default_thresholds["tail_ratio_target"]) or default_thresholds["tail_ratio_target"]
-            )
-            ignore_disqualification = bool(_get_setting("ignore_disqualification", False))
-
-        section_started = time.monotonic() if runtime_breakdown_enabled else 0.0
-        effective_psr_min_observations = int(psr_min_observations) if psr_min_observations is not None else 2
-        metrics["PSR"] = self._probabilistic_sharpe(
-            returns_series,
-            min_observations=effective_psr_min_observations,
-        )
-
-        (
-            robust_score,
-            score_components,
-            disqualified,
-            reasons,
-            psr_guardrail,
-        ) = self._evaluate_robust_score(
-            metrics,
-            fees_to_gross,
-            returns_count=returns_count,
-            trade_count=trade_count,
-            thresholds={
-                "psr_min_trades": psr_min_trades,
-                "psr_min_returns": psr_min_returns,
-                "psr_min_observations": psr_min_observations,
-                "psr_threshold": psr_threshold,
-                "fees_to_gross": fees_to_gross_limit,
-                "drawdown_threshold": drawdown_limit,
-                "turnover_threshold": turnover_limit,
-                "sharpe_target": sharpe_target,
-                "sortino_target": sortino_target,
-                "tail_ratio_target": tail_ratio_target,
-                "ignore_disqualification": ignore_disqualification,
-            },
-        )
-
-        metrics.update(
-            {
-                "gross_pnl": float(total_gross),
-                "net_pnl": float(total_net),
-                "total_commission": float(total_commission),
-                "total_spread_cost": float(total_spread),
-                "total_slippage_cost": float(total_slippage),
-                "total_swap_pnl": float(total_swap),
-                "FeesToGross": float(fees_to_gross),
-                "RobustScore": float(robust_score),
-                "Qualified": 0.0 if disqualified else 1.0,
-                "ReturnCount": float(returns_count),
-                "TradeCount": float(trade_count),
-                "Expectancy": float(expectancy),
-                "expectancy": float(expectancy),
-                "ProfitFactor": float(profit_factor),
-                "profit_factor": float(profit_factor),
-            }
-        )
-
-        psr_min_returns_meta: Optional[int] = int(psr_guardrail["min_returns"]) if psr_guardrail else (
-            int(psr_min_returns) if psr_min_returns is not None else None
-        )
-        psr_min_trades_meta: Optional[int] = int(psr_guardrail["min_trades"]) if psr_guardrail else (
-            int(psr_min_trades) if psr_min_trades is not None else None
-        )
-        psr_min_observations_meta: Optional[int] = int(psr_guardrail["min_observations"]) if psr_guardrail else (
-            int(psr_min_observations) if psr_min_observations is not None else None
-        )
-
-        metadata = {
-            "initial_equity": float(initial_equity),
-            "disqualified": disqualified,
-            "disqualify_reasons": reasons,
-            "robust_score_components": score_components,
-            "robust_score_thresholds": {
-                "drawdown": drawdown_limit,
-                "psr": psr_threshold,
-                "psr_min_returns": psr_min_returns_meta,
-                "psr_min_trades": psr_min_trades_meta,
-                "psr_min_observations": psr_min_observations_meta,
-                "fees_to_gross": fees_to_gross_limit,
-                "turnover": turnover_limit,
-                "sharpe": sharpe_target,
-                "sortino": sortino_target,
-                "tail_ratio": tail_ratio_target,
-            },
-            "sample_counts": {
-                "returns": returns_count,
-                "trades": trade_count,
-            },
-        }
-        if signal_intents is not None:
-            metadata["signal_intents"] = signal_intents
-        if psr_guardrail:
-            metadata["psr_guardrail"] = psr_guardrail
-        if early_stopped:
-            metadata.update(
-                {
-                    "disqualified": True,
-                    "disqualify_reasons": [f"early_stop: {early_stop_reason}"],
-                    "early_stopped": True,
-                    "early_stop_reason": early_stop_reason,
-                    "bars_processed": bar_count,
-                }
             )
         finalize_elapsed = max(0.0, time.monotonic() - finalize_started)
         metadata["runtime_timing"] = {
@@ -1165,6 +1031,280 @@ class Backtester:
             prepared=prepared_snapshot,
             margin_call_events=margin_call_events,
         )
+
+    def run_market(
+        self,
+        market: MarketFrames,
+        strategy: BaseStrategy,
+        risk_perc: float,
+        initial_equity: float,
+        swap_override: Optional[dict] = None,
+        *,
+        cancel_callback: Optional[Callable[[], None]] = None,
+        early_stop_conditions: Optional[Dict[str, Any]] = None,
+        window_start: Optional[datetime] = None,
+        capture_prepared: bool = False,
+        collect_diagnostics: bool = True,
+        bar_observer: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> BTResult:
+        """Run against synchronized provider-symbol feeds.
+
+        ``MarketFrames`` snapshots its mapping but intentionally retains the
+        supplied DataFrame objects. A caller sharing cached frames between
+        strategies must provide per-run copies when a strategy may mutate its
+        inputs. This engine does not mutate source frames.
+
+        ``run_single`` remains the exact legacy mono-provider execution path;
+        this additive method delegates to the strict multiprovider engine.
+        """
+        from arbitrix_core.backtest.market_engine import run_market
+
+        return run_market(
+            self,
+            market,
+            strategy,
+            risk_perc,
+            initial_equity,
+            swap_override,
+            cancel_callback=cancel_callback,
+            early_stop_conditions=early_stop_conditions,
+            window_start=window_start,
+            capture_prepared=capture_prepared,
+            collect_diagnostics=collect_diagnostics,
+            bar_observer=bar_observer,
+        )
+
+    def _build_result_payload(
+        self,
+        *,
+        daily_equity: pd.Series,
+        initial_equity: float,
+        closed_trades: List[Trade],
+        early_stop_conditions: Optional[Dict[str, Any]],
+        early_stop_flag: bool,
+        signal_intents: Optional[List[Dict[str, Any]]],
+        early_stopped: bool,
+        early_stop_reason: Optional[str],
+        bar_count: int,
+    ) -> tuple[Dict[str, float], Dict[str, Any]]:
+        """Build the metrics/metadata contract shared by every backtest path."""
+        metrics = self._compute_metrics(daily_equity, initial_equity=initial_equity)
+        total_commission = sum(t.commission_paid for t in closed_trades)
+        total_spread = sum(t.spread_cost for t in closed_trades)
+        total_slippage = sum(t.slippage_cost for t in closed_trades)
+        total_swap = sum(t.swap_pnl for t in closed_trades)
+        total_gross = sum(t.gross_pnl for t in closed_trades)
+        total_net = sum(t.net_pnl for t in closed_trades)
+        total_fees = total_commission + total_spread + total_slippage
+        winning_net = sum(t.net_pnl for t in closed_trades if t.net_pnl > 0)
+        losing_net = -sum(t.net_pnl for t in closed_trades if t.net_pnl < 0)
+        gross_abs = abs(total_gross)
+        if gross_abs <= 1e-9:
+            fees_to_gross = 1.0 if total_fees > 0 else 0.0
+        else:
+            fees_to_gross = float(total_fees) / gross_abs
+
+        returns_series, _, _ = self._returns_for_metrics(
+            daily_equity,
+            initial_equity=initial_equity,
+        )
+        returns_count = int(len(returns_series))
+        trade_count = int(len(closed_trades))
+        expectancy = (
+            float(total_net) / float(trade_count) if trade_count > 0 else 0.0
+        )
+        if losing_net <= 1e-9:
+            profit_factor = 10.0 if winning_net > 1e-9 else 0.0
+        else:
+            profit_factor = float(winning_net) / float(losing_net)
+
+        # Robust-score disqualification guardrails are only applied when
+        # explicitly provided. This avoids hidden PSR sample gating from
+        # unrelated early-stop defaults.
+        default_thresholds = {
+            "sharpe_target": 3.0,
+            "sortino_target": 4.0,
+            "tail_ratio_target": 3.0,
+        }
+        psr_min_trades: Optional[int] = None
+        psr_min_returns: Optional[int] = None
+        psr_min_observations: Optional[int] = None
+        psr_threshold: Optional[float] = None
+        fees_to_gross_limit: Optional[float] = None
+        drawdown_limit: Optional[float] = None
+        turnover_limit: Optional[float] = None
+        sharpe_target = 3.0
+        sortino_target = 4.0
+        tail_ratio_target = 3.0
+        ignore_disqualification = False
+
+        if early_stop_conditions and early_stop_flag:
+
+            def _get_optional_int(key: str) -> Optional[int]:
+                if key not in early_stop_conditions:
+                    return None
+                try:
+                    return max(0, int(early_stop_conditions.get(key)))
+                except (TypeError, ValueError):
+                    return None
+
+            def _get_optional_float(key: str) -> Optional[float]:
+                if key not in early_stop_conditions:
+                    return None
+                try:
+                    return max(0.0, float(early_stop_conditions.get(key)))
+                except (TypeError, ValueError):
+                    return None
+
+            def _get_setting(key: str, default: Any) -> Any:
+                return (
+                    early_stop_conditions[key]
+                    if key in early_stop_conditions
+                    else default
+                )
+
+            psr_min_trades = _get_optional_int("psr_min_trades")
+            psr_min_returns = _get_optional_int("psr_min_returns")
+            psr_min_observations = _get_optional_int("psr_min_observations")
+            psr_threshold = _get_optional_float("psr_threshold")
+            fees_to_gross_limit = _get_optional_float("fees_to_gross")
+            drawdown_limit = _get_optional_float("drawdown_threshold")
+            turnover_limit = _get_optional_float("turnover_threshold")
+            sharpe_target = float(
+                _get_setting(
+                    "sharpe_target",
+                    default_thresholds["sharpe_target"],
+                )
+                or default_thresholds["sharpe_target"]
+            )
+            sortino_target = float(
+                _get_setting(
+                    "sortino_target",
+                    default_thresholds["sortino_target"],
+                )
+                or default_thresholds["sortino_target"]
+            )
+            tail_ratio_target = float(
+                _get_setting(
+                    "tail_ratio_target",
+                    default_thresholds["tail_ratio_target"],
+                )
+                or default_thresholds["tail_ratio_target"]
+            )
+            ignore_disqualification = bool(
+                _get_setting("ignore_disqualification", False)
+            )
+
+        effective_psr_min_observations = (
+            int(psr_min_observations)
+            if psr_min_observations is not None
+            else 2
+        )
+        metrics["PSR"] = self._probabilistic_sharpe(
+            returns_series,
+            min_observations=effective_psr_min_observations,
+        )
+        (
+            robust_score,
+            score_components,
+            disqualified,
+            reasons,
+            psr_guardrail,
+        ) = self._evaluate_robust_score(
+            metrics,
+            fees_to_gross,
+            returns_count=returns_count,
+            trade_count=trade_count,
+            thresholds={
+                "psr_min_trades": psr_min_trades,
+                "psr_min_returns": psr_min_returns,
+                "psr_min_observations": psr_min_observations,
+                "psr_threshold": psr_threshold,
+                "fees_to_gross": fees_to_gross_limit,
+                "drawdown_threshold": drawdown_limit,
+                "turnover_threshold": turnover_limit,
+                "sharpe_target": sharpe_target,
+                "sortino_target": sortino_target,
+                "tail_ratio_target": tail_ratio_target,
+                "ignore_disqualification": ignore_disqualification,
+            },
+        )
+        metrics.update(
+            {
+                "gross_pnl": float(total_gross),
+                "net_pnl": float(total_net),
+                "total_commission": float(total_commission),
+                "total_spread_cost": float(total_spread),
+                "total_slippage_cost": float(total_slippage),
+                "total_swap_pnl": float(total_swap),
+                "FeesToGross": float(fees_to_gross),
+                "RobustScore": float(robust_score),
+                "Qualified": 0.0 if disqualified else 1.0,
+                "ReturnCount": float(returns_count),
+                "TradeCount": float(trade_count),
+                "Expectancy": float(expectancy),
+                "expectancy": float(expectancy),
+                "ProfitFactor": float(profit_factor),
+                "profit_factor": float(profit_factor),
+            }
+        )
+
+        psr_min_returns_meta: Optional[int] = (
+            int(psr_guardrail["min_returns"])
+            if psr_guardrail
+            else (int(psr_min_returns) if psr_min_returns is not None else None)
+        )
+        psr_min_trades_meta: Optional[int] = (
+            int(psr_guardrail["min_trades"])
+            if psr_guardrail
+            else (int(psr_min_trades) if psr_min_trades is not None else None)
+        )
+        psr_min_observations_meta: Optional[int] = (
+            int(psr_guardrail["min_observations"])
+            if psr_guardrail
+            else (
+                int(psr_min_observations)
+                if psr_min_observations is not None
+                else None
+            )
+        )
+        metadata: Dict[str, Any] = {
+            "initial_equity": float(initial_equity),
+            "disqualified": disqualified,
+            "disqualify_reasons": reasons,
+            "robust_score_components": score_components,
+            "robust_score_thresholds": {
+                "drawdown": drawdown_limit,
+                "psr": psr_threshold,
+                "psr_min_returns": psr_min_returns_meta,
+                "psr_min_trades": psr_min_trades_meta,
+                "psr_min_observations": psr_min_observations_meta,
+                "fees_to_gross": fees_to_gross_limit,
+                "turnover": turnover_limit,
+                "sharpe": sharpe_target,
+                "sortino": sortino_target,
+                "tail_ratio": tail_ratio_target,
+            },
+            "sample_counts": {
+                "returns": returns_count,
+                "trades": trade_count,
+            },
+        }
+        if signal_intents is not None:
+            metadata["signal_intents"] = signal_intents
+        if psr_guardrail:
+            metadata["psr_guardrail"] = psr_guardrail
+        if early_stopped:
+            metadata.update(
+                {
+                    "disqualified": True,
+                    "disqualify_reasons": [f"early_stop: {early_stop_reason}"],
+                    "early_stopped": True,
+                    "early_stop_reason": early_stop_reason,
+                    "bars_processed": bar_count,
+                }
+            )
+        return metrics, metadata
 
     @staticmethod
     def _order_created_at(order: Order) -> Optional[pd.Timestamp]:
@@ -1279,14 +1419,35 @@ class Backtester:
         strategy: BaseStrategy,
         signal: Signal,
         row: pd.Series,
-            risk_perc: float,
-            equity: float,
-        ) -> Optional[Order]:
-        symbol = strategy.symbol or "SYMBOL"
-        stop_points = float(strategy.stop_distance_points(row))
+        risk_perc: float,
+        equity: float,
+        *,
+        symbol: Optional[str] = None,
+        data: Any = None,
+    ) -> Optional[Order]:
+        symbol = str(
+            symbol
+            or _explicit_signal_symbol(signal)
+            or strategy.symbol
+            or "SYMBOL"
+        )
+        try:
+            from arbitrix_core.symbols.context import get_symbol_context
+
+            ctx = get_symbol_context(symbol)
+        except (KeyError, AttributeError):
+            ctx = None
+        hook_kwargs: Dict[str, Any] = {"symbol": symbol, "ctx": ctx}
+        if data is not None:
+            hook_kwargs["data"] = data
+        stop_points = float(
+            invoke_strategy_stop_distance_points(strategy, row, **hook_kwargs)
+        )
         if stop_points <= 0:
             return None
-        take_points = float(strategy.take_distance_points(row))
+        take_points = float(
+            invoke_strategy_take_distance_points(strategy, row, **hook_kwargs)
+        )
         point_value = self._account_point_value(symbol, row)
         if point_value <= 0:
             return None
@@ -1437,6 +1598,10 @@ class Backtester:
         fill_time: pd.Timestamp,
         equity: float,
     ) -> tuple[Optional[Trade], float]:
+        # Order is authoritative once created.  Keeping the legacy positional
+        # symbol parameter preserves callers while preventing cross-symbol
+        # fills from inheriting the row currently driving the engine loop.
+        symbol = order.symbol
         commission = self._commission_one_side(
             symbol,
             row,
@@ -1785,27 +1950,104 @@ class Backtester:
         equity: float,
         gross_equity: float,
         signal_intents: Optional[List[Dict[str, Any]]] = None,
+        rows_by_symbol: Optional[Dict[str, Any]] = None,
+        execution_symbols: Optional[Iterable[str]] = None,
+        data: Any = None,
     ) -> tuple[float, float, List[Trade], List[Order]]:
+        allowed_symbols = {
+            str(value)
+            for value in (execution_symbols or (symbol,))
+            if str(value).strip()
+        }
+        if not allowed_symbols:
+            raise ValueError("at least one execution symbol is required")
+        resolved_rows = dict(rows_by_symbol or {symbol: row})
+
+        def _require_row(target_symbol: str):
+            if target_symbol not in allowed_symbols:
+                raise ValueError(
+                    f"Signal targets non-executable symbol '{target_symbol}'"
+                )
+            target_row = resolved_rows.get(target_symbol)
+            if target_row is None:
+                raise ValueError(
+                    f"No execution-provider row for symbol '{target_symbol}' at {ts}"
+                )
+            return target_row
+
         for next_sig in self._normalize_signals(signals):
             filtered_sig = next_sig
+            explicit_symbol = _explicit_signal_symbol(filtered_sig)
+            # Backward compatibility: an omitted symbol keeps targeting the
+            # strategy's primary execution symbol. Multi-symbol strategies opt
+            # into another main-provider symbol explicitly on the Signal.
+            target_symbol = explicit_symbol or symbol
+            target_row = _require_row(target_symbol)
             if signal_intents is not None and filtered_sig.is_entry():
-                signal_intents.append(self._serialize_signal_intent(filtered_sig, row, ts))
+                signal_intents.append(
+                    self._serialize_signal_intent(
+                        filtered_sig,
+                        target_row,
+                        ts,
+                        resolved_symbol=target_symbol,
+                    )
+                )
 
             if filtered_sig.action == "exit":
+                remaining_trades: List[Trade] = []
                 for trade in open_trades:
+                    if trade.symbol != target_symbol:
+                        remaining_trades.append(trade)
+                        continue
                     equity, gross_equity, _ = self._close_trade(
-                        symbol, trade, row, ts, equity, gross_equity, closed_trades, reason="signal_exit"
+                        target_symbol,
+                        trade,
+                        target_row,
+                        ts,
+                        equity,
+                        gross_equity,
+                        closed_trades,
+                        reason="signal_exit",
                     )
+                remaining_orders: List[Order] = []
                 for order in working_orders:
-                    order.status = "cancelled"
-                working_orders = []
-                open_trades = []
+                    if order.symbol == target_symbol:
+                        order.status = "cancelled"
+                    else:
+                        remaining_orders.append(order)
+                working_orders = remaining_orders
+                open_trades = remaining_trades
                 continue
 
             if filtered_sig.action in ("close", "partial_close", "modify_sl", "modify_tp", "modify_price", "cancel_order"):
+                owned_symbol: Optional[str] = None
+                if filtered_sig.target_trade_id:
+                    owned_trade = next(
+                        (trade for trade in open_trades if trade.id == filtered_sig.target_trade_id),
+                        None,
+                    )
+                    if owned_trade is not None:
+                        owned_symbol = owned_trade.symbol
+                if owned_symbol is None and filtered_sig.target_order_id:
+                    owned_order = next(
+                        (order for order in working_orders if order.id == filtered_sig.target_order_id),
+                        None,
+                    )
+                    if owned_order is not None:
+                        owned_symbol = owned_order.symbol
+                if (
+                    explicit_symbol is not None
+                    and owned_symbol is not None
+                    and explicit_symbol != owned_symbol
+                ):
+                    raise ValueError(
+                        f"Signal.symbol '{explicit_symbol}' does not own target on '{owned_symbol}'"
+                    )
+                management_symbol = owned_symbol or target_symbol
+                management_row = _require_row(management_symbol)
                 equity, gross_equity, open_trades, working_orders = self._apply_management_signal(
                     filtered_sig,
-                    row,
+                    management_row,
                     ts,
                     open_trades,
                     closed_trades,
@@ -1818,7 +2060,15 @@ class Backtester:
             if not filtered_sig.is_entry():
                 continue
 
-            order = self._create_order_from_signal(strategy, filtered_sig, row, risk_perc, equity)
+            order = self._create_order_from_signal(
+                strategy,
+                filtered_sig,
+                target_row,
+                risk_perc,
+                equity,
+                symbol=target_symbol,
+                data=data,
+            )
             if order:
                 order.created_at = self._execution_timestamp(strategy, ts)
                 all_orders.append(order)
@@ -1838,6 +2088,8 @@ class Backtester:
         signal: Signal,
         row: pd.Series,
         ts: pd.Timestamp,
+        *,
+        resolved_symbol: Optional[str] = None,
     ) -> Dict[str, Any]:
         def _float_or_none(value: Any) -> Optional[float]:
             try:
@@ -1863,6 +2115,7 @@ class Backtester:
             "price": price,
             "volume": volume,
             "order_type": signal.order_type,
+            "symbol": resolved_symbol or _explicit_signal_symbol(signal),
         }
         if signal.reason:
             payload["reason"] = signal.reason
